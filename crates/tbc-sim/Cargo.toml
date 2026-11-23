@@ -1,0 +1,11 @@
+[package]
+name = "tbc-sim"
+version = "0.1.0"
+description = "Unstable-video simulator and benchmarks for software-tbc: synthetic jitter, clock drift, dropouts and noise."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tbc-core.workspace = true
