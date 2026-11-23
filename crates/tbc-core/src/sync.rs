@@ -3,22 +3,320 @@
 //! Design: SPEC.md §4.1. Implementation is tracked in the Phase 2 issues;
 //! this module currently exposes only the intended public surface.
 
-use crate::{TbcConfig, VideoFrame};
+use crate::{RatePolicy, TbcConfig, VideoFrame};
+use std::collections::VecDeque;
 
 /// Stateful synchroniser: ingest frames on the input clock, release them
 /// on the target-rate output clock according to the configured policy.
+///
+/// Output frame *k* is due at `t_k = t_0 + k * (den/num) s`, computed in
+/// integer nanoseconds from the rational rate (never floats, so the
+/// schedule cannot drift). `t_0` anchors on the first ingested frame;
+/// a slow re-anchor (below) compensates input clock drift.
 pub struct FrameSynchronizer {
-    _config: TbcConfig,
+    config: TbcConfig,
+    queue: VecDeque<VideoFrame>,
+    anchor_ns: Option<u64>,
+    /// Cumulative gradual schedule shift from drift re-anchoring.
+    anchor_adjust_ns: i64,
+    output_index: u64,
+    /// The newest frame that is due at the current target time: the one
+    /// to hold, emit, or blend from.
+    current: Option<VideoFrame>,
+    /// Whether `current` has already contributed to an output.
+    current_was_used: bool,
+    last_emitted_seq: Option<u64>,
+    dropped: u64,
+    duplicated: u64,
+    // Drift estimation: integer EMA of inter-arrival intervals.
+    last_ingest_pts: Option<u64>,
+    ema_interval_ns: Option<i64>,
+    drift_ppm: i64,
 }
 
 impl FrameSynchronizer {
     pub fn new(config: TbcConfig) -> Self {
-        FrameSynchronizer { _config: config }
+        FrameSynchronizer {
+            config,
+            queue: VecDeque::new(),
+            anchor_ns: None,
+            anchor_adjust_ns: 0,
+            output_index: 0,
+            current: None,
+            current_was_used: false,
+            last_emitted_seq: None,
+            dropped: 0,
+            duplicated: 0,
+            last_ingest_pts: None,
+            ema_interval_ns: None,
+            drift_ppm: 0,
+        }
     }
 
-    /// Placeholder until the ring buffer lands (Phase 1/2 issues).
-    pub fn ingest(&mut self, _frame: VideoFrame) {
-        unimplemented!("tracked in the Phase 1 ring-buffer issue")
+    pub fn config(&self) -> &TbcConfig {
+        &self.config
+    }
+
+    pub fn dropped_frames(&self) -> u64 {
+        self.dropped
+    }
+
+    pub fn duplicated_frames(&self) -> u64 {
+        self.duplicated
+    }
+
+    /// Estimated input clock drift in parts per million, relative to the
+    /// target rate (positive = input clock runs fast).
+    pub fn drift_ppm_estimate(&self) -> i64 {
+        self.drift_ppm
+    }
+
+    /// Nominal frame interval of the target rate, in nanoseconds.
+    fn nominal_interval_ns(&self) -> i64 {
+        (self.config.target_rate.den as i64 * 1_000_000_000) / self.config.target_rate.num as i64
+    }
+
+    /// Target time of output frame `k`, in nanoseconds.
+    fn target_ns(&self, k: u64) -> u64 {
+        let anchor = self.anchor_ns.unwrap_or(0) as i128;
+        let rate = self.config.target_rate;
+        let elapsed = (k as i128 * rate.den as i128 * 1_000_000_000) / rate.num as i128;
+        let t = anchor + elapsed + self.anchor_adjust_ns as i128;
+        t.max(0) as u64
+    }
+
+    /// Ingest one frame on the input clock. Frames must arrive with
+    /// non-decreasing `pts_ns`.
+    pub fn ingest(&mut self, frame: VideoFrame) {
+        if self.anchor_ns.is_none() {
+            self.anchor_ns = Some(frame.pts_ns);
+        }
+        if let Some(last) = self.last_ingest_pts {
+            let interval = frame.pts_ns.saturating_sub(last) as i64;
+            let ema = match self.ema_interval_ns {
+                None => interval,
+                Some(e) => e + (interval - e) / 256,
+            };
+            self.ema_interval_ns = Some(ema);
+            let nominal = self.nominal_interval_ns();
+            if nominal > 0 {
+                self.drift_ppm = ((ema - nominal) * 1_000_000) / nominal;
+            }
+        }
+        self.last_ingest_pts = Some(frame.pts_ns);
+        self.queue.push_back(frame);
+    }
+
+    /// Gradual re-anchor: when the estimated drift exceeds ±500 ppm,
+    /// shift the schedule by the per-frame error, capped at 1/8 of a
+    /// frame interval per output frame (SPEC.md §4.1).
+    ///
+    /// Estimates beyond ±10 000 ppm (1%) are not clock drift at all but
+    /// a genuinely different input rate (rate conversion); the schedule
+    /// must not chase those.
+    fn reanchor(&mut self) {
+        if self.drift_ppm.abs() <= 500 || self.drift_ppm.abs() > 10_000 {
+            return;
+        }
+        let Some(ema) = self.ema_interval_ns else {
+            return;
+        };
+        let error = ema - self.nominal_interval_ns();
+        let cap = self.nominal_interval_ns() / 8;
+        self.anchor_adjust_ns += error.clamp(-cap, cap);
+    }
+
+    /// Produce the next frame on the output clock, or `None` when no
+    /// frame has ever become due.
+    pub fn next_output(&mut self) -> Option<VideoFrame> {
+        self.anchor_ns?;
+        self.reanchor();
+        let t = self.target_ns(self.output_index);
+
+        // Retire every frame that has become due into `current`; a due
+        // frame replaced before it was ever used counts as dropped.
+        while let Some(front) = self.queue.front() {
+            if front.pts_ns > t {
+                break;
+            }
+            let frame = self.queue.pop_front().expect("front exists");
+            if self.current.is_some() && !self.current_was_used {
+                self.dropped += 1;
+            }
+            self.current = Some(frame);
+            self.current_was_used = false;
+        }
+
+        let current = self.current.as_ref()?;
+
+        // Blend policy: synthesise the frame due at t from the current
+        // frame and the next future frame.
+        if self.config.rate_policy == RatePolicy::Blend && t > current.pts_ns {
+            if let Some(next) = self.queue.front() {
+                let mut out = blend_frames(
+                    current,
+                    next,
+                    t - current.pts_ns,
+                    next.pts_ns - current.pts_ns,
+                );
+                out.pts_ns = t;
+                self.current_was_used = true;
+                self.last_emitted_seq = Some(out.sequence);
+                self.output_index += 1;
+                return Some(out);
+            }
+        }
+
+        // Hold/drop policy (and blend with nothing to blend towards):
+        // emit the current frame; re-emitting it counts as duplicated.
+        let out = current.clone();
+        if self.last_emitted_seq == Some(out.sequence) {
+            self.duplicated += 1;
+        }
+        self.current_was_used = true;
+        self.last_emitted_seq = Some(out.sequence);
+        self.output_index += 1;
+        Some(out)
+    }
+}
+
+/// Temporal blend of two frames: `out = a*(1-w) + b*w` per byte, with
+/// `w = w_num / w_den`, in integer arithmetic with rounding.
+fn blend_frames(a: &VideoFrame, b: &VideoFrame, w_num: u64, w_den: u64) -> VideoFrame {
+    let mut out = a.clone();
+    if w_den == 0 || a.data.len() != b.data.len() {
+        return out;
+    }
+    // Reduce the weight to Q16 first: the raw w_num/w_den are timestamp
+    // differences and would overflow u32 when multiplied by pixel values.
+    let w_q16 = ((w_num.min(w_den) as u128 * 65_536) / w_den as u128) as u32;
+    for (o, (x, y)) in out.data.iter_mut().zip(a.data.iter().zip(b.data.iter())) {
+        *o = ((*x as u32 * (65_536 - w_q16) + *y as u32 * w_q16 + 32_768) / 65_536) as u8;
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{FieldOrder, PixelFormat};
+
+    const DUR: u64 = 33_366_666; // ~29.97 fps, truncated like FrameRate
+
+    fn config(policy: RatePolicy) -> TbcConfig {
+        TbcConfig {
+            rate_policy: policy,
+            ..Default::default()
+        }
+    }
+
+    fn frame(sequence: u64, pts_ns: u64) -> VideoFrame {
+        VideoFrame {
+            width: 4,
+            height: 2,
+            format: PixelFormat::Rgb24,
+            field_order: FieldOrder::Progressive,
+            pts_ns,
+            sequence,
+            data: vec![0u8; PixelFormat::Rgb24.frame_size(4, 2)],
+        }
+    }
+
+    #[test]
+    fn matched_rates_pass_every_frame_in_order() {
+        let mut sync = FrameSynchronizer::new(config(RatePolicy::HoldDrop));
+        for i in 0..10 {
+            sync.ingest(frame(i, i * DUR));
+        }
+        for i in 0..10 {
+            let out = sync.next_output().expect("output");
+            assert_eq!(out.sequence, i);
+        }
+        assert_eq!(sync.dropped_frames(), 0);
+        assert_eq!(sync.duplicated_frames(), 0);
+    }
+
+    #[test]
+    fn double_rate_input_drops_about_half() {
+        let mut sync = FrameSynchronizer::new(config(RatePolicy::HoldDrop));
+        for i in 0..20 {
+            sync.ingest(frame(i, i * DUR / 2));
+        }
+        let mut last_seq = 0;
+        for _ in 0..10 {
+            let out = sync.next_output().expect("output");
+            assert!(out.sequence >= last_seq);
+            last_seq = out.sequence;
+        }
+        assert!(
+            sync.dropped_frames() >= 8,
+            "dropped was {}",
+            sync.dropped_frames()
+        );
+    }
+
+    #[test]
+    fn half_rate_input_duplicates_frames() {
+        let mut sync = FrameSynchronizer::new(config(RatePolicy::HoldDrop));
+        for i in 0..5 {
+            sync.ingest(frame(i, i * 2 * DUR));
+        }
+        for _ in 0..10 {
+            assert!(sync.next_output().is_some());
+        }
+        assert!(
+            sync.duplicated_frames() >= 4,
+            "duplicated was {}",
+            sync.duplicated_frames()
+        );
+    }
+
+    #[test]
+    fn no_input_no_output() {
+        let mut sync = FrameSynchronizer::new(config(RatePolicy::HoldDrop));
+        assert!(sync.next_output().is_none());
+    }
+
+    #[test]
+    fn drift_estimate_converges_for_fast_input() {
+        // Input clock 1000 ppm fast: intervals are 0.1% longer than nominal.
+        let mut sync = FrameSynchronizer::new(config(RatePolicy::HoldDrop));
+        let fast_interval = DUR + DUR / 1000;
+        for i in 0..600u64 {
+            sync.ingest(frame(i, i * fast_interval));
+            let _ = sync.next_output();
+        }
+        let ppm = sync.drift_ppm_estimate();
+        assert!((800..=1200).contains(&ppm), "drift estimate was {ppm} ppm");
+    }
+
+    #[test]
+    fn blend_frames_math() {
+        let mut a = frame(0, 0);
+        a.data = vec![0u8; 24];
+        let mut b = frame(1, DUR);
+        b.data = vec![200u8; 24];
+        let mid = blend_frames(&a, &b, 1, 2);
+        assert!(mid.data.iter().all(|&v| v == 100));
+        let at_a = blend_frames(&a, &b, 0, 2);
+        assert!(at_a.data.iter().all(|&v| v == 0));
+        let at_b = blend_frames(&a, &b, 2, 2);
+        assert!(at_b.data.iter().all(|&v| v == 200));
+    }
+
+    #[test]
+    fn blend_policy_outputs_interpolated_frames() {
+        let mut sync = FrameSynchronizer::new(config(RatePolicy::Blend));
+        let mut a = frame(0, 0);
+        a.data = vec![0u8; 24];
+        let mut b = frame(1, 2 * DUR);
+        b.data = vec![200u8; 24];
+        sync.ingest(a);
+        sync.ingest(b);
+        let first = sync.next_output().expect("first"); // t=0 -> a itself
+        assert!(first.data.iter().all(|&v| v == 0));
+        let second = sync.next_output().expect("second"); // t=DUR -> halfway
+        assert!(second.data.iter().all(|&v| v == 100));
     }
 }
 
