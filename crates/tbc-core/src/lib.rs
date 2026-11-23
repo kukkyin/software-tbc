@@ -4,6 +4,8 @@
 //! according to a [`TbcConfig`] and reports [`Telemetry`] snapshots.
 //! See `SPEC.md` at the repository root for the full design.
 
+pub mod field;
+pub mod guard;
 pub mod jitter;
 pub mod pool;
 pub mod procamp;
