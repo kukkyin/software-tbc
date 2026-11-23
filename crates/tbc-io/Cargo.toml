@@ -1,0 +1,12 @@
+[package]
+name = "tbc-io"
+version = "0.1.0"
+description = "Frame sources and sinks for software-tbc: raw files, stdio pipes for FFmpeg, and plugin traits for capture devices."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tbc-core.workspace = true
+thiserror.workspace = true
