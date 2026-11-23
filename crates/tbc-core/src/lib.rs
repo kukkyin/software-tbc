@@ -5,6 +5,7 @@
 //! See `SPEC.md` at the repository root for the full design.
 
 pub mod jitter;
+pub mod pool;
 pub mod procamp;
 pub mod sync;
 pub mod telemetry;
@@ -155,6 +156,48 @@ pub struct TbcConfig {
     pub signal_loss: SignalLossPolicy,
 }
 
+impl TbcConfig {
+    /// Check the configuration for inconsistencies before a run starts.
+    pub fn validate(&self) -> Result<(), TbcError> {
+        if self.width == 0 || self.height == 0 {
+            return Err(TbcError::InvalidConfig(
+                "width and height must be non-zero".into(),
+            ));
+        }
+        if self.format == PixelFormat::Yuv420p && (self.width % 2 == 1 || self.height % 2 == 1) {
+            return Err(TbcError::InvalidConfig(
+                "yuv420p requires even width and height".into(),
+            ));
+        }
+        if self.buffer_frames == 0 || self.buffer_frames > 240 {
+            return Err(TbcError::InvalidConfig(
+                "buffer_frames must be within 1..=240".into(),
+            ));
+        }
+        if self.target_rate.num == 0 || self.target_rate.den == 0 {
+            return Err(TbcError::InvalidConfig(
+                "target_rate numerator and denominator must be non-zero".into(),
+            ));
+        }
+        let p = &self.procamp;
+        if ![
+            p.luma_gain,
+            p.pedestal,
+            p.saturation,
+            p.hue_degrees,
+            p.gamma,
+        ]
+        .iter()
+        .all(|v| v.is_finite())
+        {
+            return Err(TbcError::InvalidConfig(
+                "procamp values must be finite".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl Default for TbcConfig {
     fn default() -> Self {
         TbcConfig {
@@ -181,6 +224,68 @@ mod tests {
         assert_eq!(PixelFormat::Yuv420p.frame_size(720, 480), 720 * 480 * 3 / 2);
         assert_eq!(PixelFormat::Yuv422p.frame_size(720, 480), 720 * 480 * 2);
         assert_eq!(PixelFormat::Rgb24.frame_size(720, 480), 720 * 480 * 3);
+    }
+
+    #[test]
+    fn default_config_is_valid() {
+        assert!(TbcConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_bad_geometry() {
+        let c = TbcConfig {
+            width: 0,
+            ..Default::default()
+        };
+        assert!(matches!(c.validate(), Err(TbcError::InvalidConfig(_))));
+        let c = TbcConfig {
+            format: PixelFormat::Yuv420p,
+            width: 719,
+            ..Default::default()
+        };
+        assert!(matches!(c.validate(), Err(TbcError::InvalidConfig(_))));
+    }
+
+    #[test]
+    fn validate_rejects_bad_buffer_and_rate() {
+        let c = TbcConfig {
+            buffer_frames: 0,
+            ..Default::default()
+        };
+        assert!(c.validate().is_err());
+        let c = TbcConfig {
+            buffer_frames: 241,
+            ..Default::default()
+        };
+        assert!(c.validate().is_err());
+        let c = TbcConfig {
+            target_rate: FrameRate {
+                num: 30_000,
+                den: 0,
+            },
+            ..Default::default()
+        };
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_non_finite_procamp() {
+        let c = TbcConfig {
+            procamp: procamp::ProcAmpConfig {
+                luma_gain: f32::NAN,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(c.validate().is_err());
+        let c = TbcConfig {
+            procamp: procamp::ProcAmpConfig {
+                gamma: f32::INFINITY,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(c.validate().is_err());
     }
 
     #[test]
