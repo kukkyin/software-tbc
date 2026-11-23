@@ -1,0 +1,19 @@
+[package]
+name = "tbc-cli"
+version = "0.1.0"
+description = "Command-line front end for software-tbc: pipe raw video through the TBC pipeline with TOML config and presets."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "software-tbc"
+path = "src/main.rs"
+
+[dependencies]
+tbc-core.workspace = true
+tbc-io.workspace = true
+clap.workspace = true
+serde.workspace = true
+toml.workspace = true
