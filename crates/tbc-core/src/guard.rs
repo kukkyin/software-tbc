@@ -111,12 +111,20 @@ fn blank_frame(width: u32, height: u32, format: PixelFormat) -> VideoFrame {
 pub fn black_frame(width: u32, height: u32, format: PixelFormat) -> VideoFrame {
     let mut frame = blank_frame(width, height, format);
     match format {
-        PixelFormat::Yuv422p => {
+        PixelFormat::Yuv422p | PixelFormat::Yuyv => {
             for quad in frame.data.chunks_exact_mut(4) {
                 quad[0] = 16;
                 quad[1] = 128;
                 quad[2] = 16;
                 quad[3] = 128;
+            }
+        }
+        PixelFormat::Uyvy => {
+            for quad in frame.data.chunks_exact_mut(4) {
+                quad[0] = 128;
+                quad[1] = 16;
+                quad[2] = 128;
+                quad[3] = 16;
             }
         }
         PixelFormat::Yuv420p => {
@@ -162,7 +170,7 @@ fn bar_index(x: u32, width: u32) -> usize {
 pub fn test_pattern(width: u32, height: u32, format: PixelFormat) -> VideoFrame {
     let mut frame = blank_frame(width, height, format);
     match format {
-        PixelFormat::Yuv422p => {
+        PixelFormat::Yuv422p | PixelFormat::Yuyv => {
             for line in 0..height as usize {
                 let start = line * width as usize * 2;
                 for x in 0..width {
@@ -173,6 +181,21 @@ pub fn test_pattern(width: u32, height: u32, format: PixelFormat) -> VideoFrame 
                         frame.data[o + 1] = cb;
                     } else {
                         frame.data[o + 1] = cr;
+                    }
+                }
+            }
+        }
+        PixelFormat::Uyvy => {
+            for line in 0..height as usize {
+                let start = line * width as usize * 2;
+                for x in 0..width {
+                    let (y, cb, cr) = BARS_YUV[bar_index(x, width)];
+                    let o = start + x as usize * 2;
+                    frame.data[o + 1] = y;
+                    if x % 2 == 0 {
+                        frame.data[o] = cb;
+                    } else {
+                        frame.data[o] = cr;
                     }
                 }
             }
