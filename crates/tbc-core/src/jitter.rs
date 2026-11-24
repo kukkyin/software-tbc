@@ -262,6 +262,18 @@ pub struct JitterDetector {
 }
 
 impl JitterDetector {
+    /// The current search range in pixels.
+    pub fn max_shift_px(&self) -> u32 {
+        self.max_shift_px as u32
+    }
+
+    /// Change the search range (Issue #32). Safe at any time: the
+    /// correlation buffer is (re)sized from this value on every
+    /// `estimate` call.
+    pub fn set_max_shift_px(&mut self, max_shift_px: u32) {
+        self.max_shift_px = max_shift_px as i32;
+    }
+
     pub fn new(max_shift_px: u32) -> Self {
         JitterDetector {
             max_shift_px: max_shift_px as i32,
