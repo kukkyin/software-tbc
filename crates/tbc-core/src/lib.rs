@@ -45,6 +45,15 @@ pub enum PixelFormat {
     /// Packed YUV 4:2:2, 8-bit, Y-U-Y-V byte order (FFmpeg `yuyv422`).
     /// Same boundary role as `Uyvy`.
     Yuyv,
+    /// Planar YUV 4:2:0, 10-bit samples in u16 little-endian (values
+    /// in the low 10 bits; FFmpeg `yuv420p10le`). Boundary format:
+    /// converted to `Yuv420p` for processing (Issue #27).
+    Yuv420p10,
+    /// Planar YUV 4:2:2, 10-bit samples in u16 little-endian (values
+    /// in the low 10 bits; FFmpeg `yuv422p10le`). Boundary format:
+    /// converted to `Yuv422p` for processing (Issue #27). Unlike the
+    /// pipeline's packed `Yuv422p`, this layout really is planar.
+    Yuv422p10,
 }
 
 impl PixelFormat {
@@ -55,6 +64,8 @@ impl PixelFormat {
             PixelFormat::Yuv420p => px * 3 / 2,
             PixelFormat::Yuv422p | PixelFormat::Uyvy | PixelFormat::Yuyv => px * 2,
             PixelFormat::Rgb24 => px * 3,
+            PixelFormat::Yuv420p10 => px * 3,
+            PixelFormat::Yuv422p10 => px * 4,
         }
     }
 
@@ -63,6 +74,24 @@ impl PixelFormat {
     pub fn is_packed_422(self) -> bool {
         matches!(self, PixelFormat::Uyvy | PixelFormat::Yuyv)
     }
+
+    /// Whether this format carries 10-bit samples (u16 LE, values in
+    /// the low 10 bits) and is converted to 8-bit for processing.
+    pub fn is_10bit(self) -> bool {
+        matches!(self, PixelFormat::Yuv420p10 | PixelFormat::Yuv422p10)
+    }
+}
+
+/// Scale a 10-bit sample down to 8 bits, rounding to nearest
+/// (1023 maps to 255 exactly). Out-of-range inputs are clamped.
+pub(crate) fn scale_10_to_8(v: u16) -> u8 {
+    ((v.min(1023) as u32 * 255 + 511) / 1023) as u8
+}
+
+/// Scale an 8-bit sample up to 10 bits (255 maps to 1023 exactly;
+/// limited-range values scale proportionally, e.g. 16 -> 64).
+pub(crate) fn scale_8_to_10(v: u8) -> u16 {
+    ((v as u32 * 1023 + 127) / 255) as u16
 }
 
 /// Rational frame rate, e.g. 30000/1001 for 29.97 fps.
@@ -193,6 +222,124 @@ impl VideoFrame {
     }
 }
 
+impl VideoFrame {
+    /// Convert a 10-bit frame into its 8-bit pipeline equivalent
+    /// (Issue #27): `Yuv420p10` -> `Yuv420p` (planar to planar) and
+    /// `Yuv422p10` -> `Yuv422p` (planar to the pipeline's packed
+    /// layout), scaling every sample with [`scale_10_to_8`]. An
+    /// 8-bit frame converts to a copy of itself.
+    pub fn to_8bit(&self) -> Result<VideoFrame, TbcError> {
+        self.validate()?;
+        let (w, h) = (self.width as usize, self.height as usize);
+        match self.format {
+            PixelFormat::Yuv420p10 => {
+                let mut out = self.clone();
+                out.format = PixelFormat::Yuv420p;
+                out.data = self
+                    .data
+                    .chunks_exact(2)
+                    .map(|c| scale_10_to_8(u16::from_le_bytes([c[0], c[1]])))
+                    .collect();
+                Ok(out)
+            }
+            PixelFormat::Yuv422p10 => {
+                let px = w * h;
+                let y_plane = &self.data[..px * 2];
+                let u_plane = &self.data[px * 2..px * 3];
+                let v_plane = &self.data[px * 3..];
+                let sample = |plane: &[u8], i: usize| {
+                    scale_10_to_8(u16::from_le_bytes([plane[i * 2], plane[i * 2 + 1]]))
+                };
+                let mut data = Vec::with_capacity(px * 2);
+                for line in 0..h {
+                    for pair in 0..w / 2 {
+                        let y0 = sample(y_plane, line * w + pair * 2);
+                        let y1 = sample(y_plane, line * w + pair * 2 + 1);
+                        let u = sample(u_plane, line * (w / 2) + pair);
+                        let v = sample(v_plane, line * (w / 2) + pair);
+                        data.extend_from_slice(&[y0, u, y1, v]);
+                    }
+                }
+                let mut out = self.clone();
+                out.format = PixelFormat::Yuv422p;
+                out.data = data;
+                Ok(out)
+            }
+            _ => Ok(self.clone()),
+        }
+    }
+
+    /// Inverse of [`VideoFrame::to_8bit`]: expand an 8-bit frame
+    /// into the 10-bit boundary format `format`, scaling every
+    /// sample with [`scale_8_to_10`]. The source must be the
+    /// matching 8-bit format (`Yuv420p` for `Yuv420p10`, `Yuv422p`
+    /// for `Yuv422p10`); a non-10-bit target returns a copy when it
+    /// equals the source format and an error otherwise.
+    pub fn from_8bit(frame: &VideoFrame, format: PixelFormat) -> Result<VideoFrame, TbcError> {
+        let (w, h) = (frame.width as usize, frame.height as usize);
+        let push =
+            |data: &mut Vec<u8>, v: u8| data.extend_from_slice(&scale_8_to_10(v).to_le_bytes());
+        match format {
+            PixelFormat::Yuv420p10 => {
+                if frame.format != PixelFormat::Yuv420p {
+                    return Err(TbcError::InvalidConfig(format!(
+                        "from_8bit to yuv420p10 needs a yuv420p source, got {:?}",
+                        frame.format
+                    )));
+                }
+                frame.validate()?;
+                let mut data = Vec::with_capacity(frame.data.len() * 2);
+                for &b in &frame.data {
+                    push(&mut data, b);
+                }
+                let mut out = frame.clone();
+                out.format = format;
+                out.data = data;
+                Ok(out)
+            }
+            PixelFormat::Yuv422p10 => {
+                if frame.format != PixelFormat::Yuv422p {
+                    return Err(TbcError::InvalidConfig(format!(
+                        "from_8bit to yuv422p10 needs a yuv422p source, got {:?}",
+                        frame.format
+                    )));
+                }
+                frame.validate()?;
+                let px = w * h;
+                let mut data = vec![0u8; px * 4];
+                let put = |data: &mut [u8], plane_off: usize, i: usize, v: u8| {
+                    data[plane_off + i * 2..plane_off + i * 2 + 2]
+                        .copy_from_slice(&scale_8_to_10(v).to_le_bytes());
+                };
+                for line in 0..h {
+                    for pair in 0..w / 2 {
+                        let quad = line * w * 2 + pair * 4;
+                        let (y0, u, y1, v) = (
+                            frame.data[quad],
+                            frame.data[quad + 1],
+                            frame.data[quad + 2],
+                            frame.data[quad + 3],
+                        );
+                        put(&mut data, 0, line * w + pair * 2, y0);
+                        put(&mut data, 0, line * w + pair * 2 + 1, y1);
+                        put(&mut data, px * 2, line * (w / 2) + pair, u);
+                        put(&mut data, px * 3, line * (w / 2) + pair, v);
+                    }
+                }
+                let mut out = frame.clone();
+                out.format = format;
+                out.data = data;
+                Ok(out)
+            }
+            other if other == frame.format => Ok(frame.clone()),
+            other => Err(TbcError::InvalidConfig(format!(
+                "cannot convert {:?} to {other:?} with from_8bit",
+                frame.format
+            ))),
+        }
+    }
+}
+
 /// Reorder each 4-byte group of packed 4:2:2 data between the
 /// U-Y-V-Y and Y-U-Y-V orders (the operation is its own inverse):
 /// `[a, b, c, d]` becomes `[b, a, d, c]`.
@@ -249,14 +396,18 @@ impl TbcConfig {
                 "width and height must be non-zero".into(),
             ));
         }
-        if self.format == PixelFormat::Yuv420p && (self.width % 2 == 1 || self.height % 2 == 1) {
+        if matches!(self.format, PixelFormat::Yuv420p | PixelFormat::Yuv420p10)
+            && (self.width % 2 == 1 || self.height % 2 == 1)
+        {
             return Err(TbcError::InvalidConfig(
-                "yuv420p requires even width and height".into(),
+                "yuv420 formats require even width and height".into(),
             ));
         }
-        if self.format.is_packed_422() && self.width % 2 == 1 {
+        if (self.format.is_packed_422() || self.format == PixelFormat::Yuv422p10)
+            && self.width % 2 == 1
+        {
             return Err(TbcError::InvalidConfig(
-                "uyvy/yuyv require even width".into(),
+                "this format requires even width".into(),
             ));
         }
         if self.buffer_frames == 0 || self.buffer_frames > 240 {
@@ -491,5 +642,116 @@ mod tests {
             short.to_yuv422p(),
             Err(TbcError::FrameSizeMismatch { .. })
         ));
+    }
+
+    fn data10(samples: &[u16]) -> Vec<u8> {
+        samples.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn ten_bit_frame_size_and_validation() {
+        assert_eq!(PixelFormat::Yuv420p10.frame_size(720, 480), 720 * 480 * 3);
+        assert_eq!(PixelFormat::Yuv422p10.frame_size(720, 480), 720 * 480 * 4);
+        assert!(PixelFormat::Yuv420p10.is_10bit());
+        assert!(PixelFormat::Yuv422p10.is_10bit());
+        assert!(!PixelFormat::Yuv422p.is_10bit());
+        // The 10-bit formats keep the 8-bit geometry constraints.
+        let c = TbcConfig {
+            format: PixelFormat::Yuv420p10,
+            height: 479,
+            ..Default::default()
+        };
+        assert!(c.validate().is_err());
+        let c = TbcConfig {
+            format: PixelFormat::Yuv422p10,
+            width: 719,
+            ..Default::default()
+        };
+        assert!(c.validate().is_err());
+        let c = TbcConfig {
+            format: PixelFormat::Yuv422p10,
+            width: 720,
+            ..Default::default()
+        };
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn ten_bit_scaling_endpoints() {
+        assert_eq!(scale_10_to_8(0), 0);
+        assert_eq!(scale_10_to_8(1023), 255);
+        assert_eq!(scale_10_to_8(512), 128);
+        assert_eq!(scale_10_to_8(64), 16);
+        assert_eq!(scale_10_to_8(2000), 255); // clamped
+        assert_eq!(scale_8_to_10(0), 0);
+        assert_eq!(scale_8_to_10(255), 1023);
+        assert_eq!(scale_8_to_10(16), 64);
+        assert_eq!(scale_8_to_10(128), 514);
+    }
+
+    #[test]
+    fn yuv422p10_converts_to_packed_8bit() {
+        // 4x1: Y = [0, 256, 512, 1023], U = [940, 100], V = [64, 200].
+        let mut samples = vec![0u16, 256, 512, 1023];
+        samples.extend_from_slice(&[940, 100]);
+        samples.extend_from_slice(&[64, 200]);
+        let frame = frame_with(PixelFormat::Yuv422p10, data10(&samples), 4, 1);
+        let out = frame.to_8bit().expect("convert");
+        assert_eq!(out.format, PixelFormat::Yuv422p);
+        // Packed quads [Y0, U, Y1, V] with scaled samples.
+        assert_eq!(out.data, vec![0, 234, 64, 16, 128, 25, 255, 50]);
+        // And back: planar layout restored, values within a few LSBs.
+        let back = VideoFrame::from_8bit(&out, PixelFormat::Yuv422p10).expect("expand");
+        assert_eq!(back.format, PixelFormat::Yuv422p10);
+        let back_samples: Vec<u16> = back
+            .data
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        for (a, b) in samples.iter().zip(back_samples.iter()) {
+            assert!((*a as i32 - *b as i32).abs() <= 4, "{a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn eight_bit_round_trip_through_10bit_is_exact() {
+        let data: Vec<u8> = (0..PixelFormat::Yuv422p.frame_size(64, 64))
+            .map(|i| (i * 37 % 256) as u8)
+            .collect();
+        for target in [PixelFormat::Yuv422p10, PixelFormat::Yuv420p10] {
+            let source_format = if target == PixelFormat::Yuv422p10 {
+                PixelFormat::Yuv422p
+            } else {
+                PixelFormat::Yuv420p
+            };
+            let d = if source_format == PixelFormat::Yuv420p {
+                (0..PixelFormat::Yuv420p.frame_size(64, 64))
+                    .map(|i| (i * 41 % 256) as u8)
+                    .collect::<Vec<u8>>()
+            } else {
+                data.clone()
+            };
+            let frame = frame_with(source_format, d.clone(), 64, 64);
+            let up = VideoFrame::from_8bit(&frame, target).expect("expand");
+            let back = up.to_8bit().expect("reduce");
+            assert_eq!(back.format, source_format);
+            assert_eq!(back.data, d, "round trip via {target:?}");
+        }
+    }
+
+    #[test]
+    fn ten_bit_conversion_rejects_wrong_sources() {
+        let yuv422 = frame_with(PixelFormat::Yuv422p, vec![0; 4 * 4 * 2], 4, 4);
+        assert!(VideoFrame::from_8bit(&yuv422, PixelFormat::Yuv420p10).is_err());
+        let yuv420 = frame_with(
+            PixelFormat::Yuv420p,
+            vec![0; PixelFormat::Yuv420p.frame_size(4, 4)],
+            4,
+            4,
+        );
+        assert!(VideoFrame::from_8bit(&yuv420, PixelFormat::Yuv422p10).is_err());
+        // An 8-bit frame converts to itself.
+        let same = yuv422.to_8bit().expect("identity");
+        assert_eq!(same.data, yuv422.data);
     }
 }
