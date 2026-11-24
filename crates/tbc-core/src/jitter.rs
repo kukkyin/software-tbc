@@ -13,7 +13,7 @@
 //! multiply-accumulate loop for the cross term. No heap allocation happens
 //! per line; scratch buffers live in the detector.
 
-use crate::{PixelFormat, TbcError, VideoFrame};
+use crate::{scale_10_to_8, PixelFormat, TbcError, VideoFrame};
 
 /// Estimated horizontal shift of one line, in sub-pixel units (1/256 px).
 /// Positive means the line's content sits that far to the *right* of the
@@ -57,6 +57,13 @@ fn extract_luma(frame: &VideoFrame, out: &mut Vec<u8>) -> bool {
                 }
             }
         }
+        PixelFormat::Yuv420p10 | PixelFormat::Yuv422p10 => {
+            // Both planar 10-bit layouts start with the Y plane as
+            // u16 LE samples; reduce to 8-bit luma (Issue #27).
+            for (i, chunk) in frame.data.chunks_exact(2).take(w * h).enumerate() {
+                out[i] = scale_10_to_8(u16::from_le_bytes([chunk[0], chunk[1]]));
+            }
+        }
         PixelFormat::Rgb24 => {
             for l in 0..h {
                 let src = &frame.data[l * w * 3..l * w * 3 + w * 3];
@@ -98,6 +105,15 @@ pub(crate) fn luma_row(frame: &VideoFrame, line: u32) -> Option<Vec<u8>> {
             let start = l * w * 2;
             let line_data = frame.data.get(start..start + w * 2)?;
             (0..w).map(|x| line_data[x * 2 + 1]).collect()
+        }
+        PixelFormat::Yuv420p10 | PixelFormat::Yuv422p10 => {
+            let start = l * w * 2;
+            let line_data = frame.data.get(start..start + w * 2)?;
+            (0..w)
+                .map(|x| {
+                    scale_10_to_8(u16::from_le_bytes([line_data[x * 2], line_data[x * 2 + 1]]))
+                })
+                .collect()
         }
         PixelFormat::Rgb24 => {
             let start = l * w * 3;
