@@ -166,6 +166,16 @@ impl ProcAmp {
                     }
                 }
             }
+            PixelFormat::Nv12 => {
+                // Process in the planar 4:2:0 domain and convert
+                // back (Issue #33); same boundary pattern as 10-bit.
+                if let Ok(mut fp) = frame.to_yuv420p() {
+                    self.apply(&mut fp);
+                    if let Ok(back) = VideoFrame::from_yuv420p(&fp, frame.format) {
+                        frame.data = back.data;
+                    }
+                }
+            }
         }
     }
 
