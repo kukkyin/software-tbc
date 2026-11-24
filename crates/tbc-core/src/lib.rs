@@ -445,6 +445,9 @@ pub enum SignalLossPolicy {
     Blackout,
     /// Output a simple test pattern (colour bars).
     TestPattern,
+    /// Substitute nothing: the synchronizer's frame is emitted
+    /// unprocessed, with every correction stage bypassed (Issue #34).
+    Passthrough,
 }
 
 /// Full pipeline configuration. Mirrors the TOML schema in SPEC.md §7.
