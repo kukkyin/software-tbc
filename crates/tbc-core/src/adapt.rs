@@ -42,7 +42,7 @@ fn luma_min_max(frame: &VideoFrame) -> Option<(u8, u8)> {
                 max = max.max(y);
             }
         }
-        PixelFormat::Yuv420p => {
+        PixelFormat::Yuv420p | PixelFormat::Nv12 => {
             let y_size = (frame.width * frame.height) as usize;
             for &y in frame.data.iter().take(y_size) {
                 min = min.min(y);
