@@ -1,0 +1,52 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  release:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify tag matches crate version
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}".TrimStart("v")
+          $toml = Get-Content crates/tbc-cli/Cargo.toml -Raw
+          if ($toml -notmatch 'version\s*=\s*"([^"]+)"') { throw "version not found in tbc-cli/Cargo.toml" }
+          $crateVersion = $Matches[1]
+          if ($tag -ne $crateVersion) { throw "Tag v$tag does not match crate version $crateVersion" }
+          Write-Host "Releasing software-tbc $crateVersion"
+
+      - name: Build release binary
+        run: cargo build --release --locked -p tbc-cli
+
+      - name: Package Windows zip
+        shell: pwsh
+        run: |
+          $version = "${{ github.ref_name }}"
+          $stage = "software-tbc-$version-windows-x86_64"
+          New-Item -ItemType Directory -Path $stage | Out-Null
+          Copy-Item target/release/software-tbc.exe $stage
+          Copy-Item README.md $stage
+          Copy-Item LICENSE $stage
+          Copy-Item examples $stage -Recurse
+          Compress-Archive -Path $stage -DestinationPath "$stage.zip"
+          $hash = (Get-FileHash "$stage.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $stage.zip" | Out-File -Encoding ascii "$stage.zip.sha256"
+          Write-Host "SHA-256: $hash"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            software-tbc-*.zip
+            software-tbc-*.zip.sha256
+          generate_release_notes: true
