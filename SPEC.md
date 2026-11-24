@@ -62,7 +62,7 @@ software-tbc/
 正の定義は `crates/tbc-core/src/lib.rs`。要点:
 
 ```rust
-pub enum PixelFormat { Yuv420p, Yuv422p, Rgb24, Uyvy, Yuyv, Yuv420p10, Yuv422p10 }  // frame_size(w,h) を提供
+pub enum PixelFormat { Yuv420p, Yuv422p, Rgb24, Uyvy, Yuyv, Yuv420p10, Yuv422p10, Nv12 }  // frame_size(w,h) を提供
 pub struct FrameRate { pub num: u32, pub den: u32 }     // 有理数。29.97 = 30000/1001
 pub enum FieldOrder { Progressive, TopFieldFirst, BottomFieldFirst }
 pub struct VideoFrame {
@@ -89,6 +89,11 @@ pub enum TbcError { FrameSizeMismatch{..}, InvalidConfig(String), SignalLost }
 対応する最近傍丸め）で、8→10→8 の往復は無損失、10→8→10 の往復誤差は数 LSB 以内。
 上位ビットに値を格納する変種（p010 等）は対象外。幾何制約は 8bit 版と同じ
 （420 系は偶数幅・偶数高さ、422 系は偶数幅）。
+
+注記（Issue #33）: `Nv12` は Y プレーン＋Cb/Cr インターリーブプレーンの
+セミプラナー 4:2:0 境界形式（FFmpeg の `nv12`）で、
+`VideoFrame::to_yuv420p` / `from_yuv420p` により内部表現の `Yuv420p` と
+可逆変換する。幾何制約は 420 系と同じ（偶数幅・偶数高さ）。
 
 エラー方針:
 
@@ -334,7 +339,7 @@ output_width = 720              # 出力寸法（省略時 = 処理寸法、§4.
 output_height = 480
 pad_left = 0
 pad_top = 0
-format = "yuv422p"              # yuv420p | yuv422p | rgb24 | uyvy | yuyv | yuv420p10le | yuv422p10le
+format = "yuv422p"              # yuv420p | yuv422p | rgb24 | uyvy | yuyv | yuv420p10le | yuv422p10le | nv12
 field_order = "bottom-first"    # progressive | top-first | bottom-first | auto（自動判定、§4.3）
 target_rate = "30000/1001"      # 有理数文字列
 rate_policy = "hold-drop"       # hold-drop | blend | motion-interpolate
