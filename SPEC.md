@@ -183,7 +183,14 @@ pub enum TbcError { FrameSizeMismatch{..}, InvalidConfig(String), SignalLost }
 - 検出条件（いずれか）: (a) §4.1 の保持継続が `signal_loss_timeout_ms` 超過、
   (b) フレーム全体の輝度分散が閾値未満かつ色差がほぼ無彩色（無信号ノイズ/ブルーバック相当は除く）、
   (c) 入力フレームの `validate()` 失敗が連続3回。
-- 動作（`SignalLossPolicy`）: `LastFrameHold`（既定）/ `Blackout` / `TestPattern`（カラーバー生成）。
+- 動作（`SignalLossPolicy`）: `LastFrameHold`（既定）/ `Blackout` / `TestPattern`（カラーバー生成）/
+  `Passthrough`（Issue #34）。`Passthrough` は代替フレームを出さず、同期段を通った
+  入力フレームを補正段（ヘッドスイッチングマスク・ジッタ補正・プロックアンプ・
+  自動適応の観測）をバイパスしてそのまま送出する。同期と出力段の形式変換・
+  パディングは維持し、フレームは捏造しない（同期段が出力を返さない間は送出しない）。
+  バイパス中は検出器・適応ループにフレームを渡さないため、推定状態は信号断前の
+  まま保たれる。終了時点で信号断状態なら `--fail-on-signal-loss` の終了コード 4 は
+  本ポリシーでも従来どおり適用される。
 - 復帰: 良好なフレームが2フレーム連続で到着したら通常処理へ復帰し、イベントをログに残す。
 - 信号断中も出力クロックは止めない（下流のFFmpeg等がタイムアウトしないため）。
 
@@ -283,6 +290,7 @@ CLI（`tbc-cli`、バイナリ名 `software-tbc`）:
   `--preset`、`--config`（TOML）、`--stamp nominal|wall-clock`、`--standard ntsc|pal|1080i`、
   `--field-order progressive|top-first|bottom-first|auto`、
   `--head-switch-lines N`、`--head-switch-mode replicate|interpolate`、`--auto-adapt`、
+  `--signal-loss last-frame-hold|blackout|test-pattern|passthrough`（§4.5）、
   幾何分離（§4.8）: `--input-width/--input-height`、`--crop-left/--crop-top`、
   `--output-width/--output-height`、`--pad-left/--pad-top`。
   優先順位: CLI引数 > 設定ファイル > プリセット > 既定値。
@@ -347,7 +355,7 @@ buffer_frames = 8
 jitter_correction = true
 head_switch_lines = 0           # 下部マスクのライン数（0 = 無効、§4.7）
 head_switch_mode = "replicate"  # replicate | interpolate
-signal_loss = "last-frame-hold" # last-frame-hold | blackout | test-pattern
+signal_loss = "last-frame-hold" # last-frame-hold | blackout | test-pattern | passthrough（信号断中は無加工送出、§4.5）
 signal_loss_timeout_ms = 200
 telemetry_interval_ms = 1000
 stamp = "nominal"               # nominal | wall-clock（§6、Issue #20）
