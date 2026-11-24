@@ -6,6 +6,7 @@
 
 pub mod field;
 pub mod guard;
+pub mod head_switch;
 pub mod jitter;
 pub mod pool;
 pub mod procamp;
@@ -385,6 +386,9 @@ pub struct TbcConfig {
     pub buffer_frames: usize,
     pub procamp: procamp::ProcAmpConfig,
     pub jitter_correction: bool,
+    /// Head-switching noise concealment (Issue #29); disabled by
+    /// default (`lines: 0`).
+    pub head_switch: head_switch::HeadSwitchConfig,
     pub signal_loss: SignalLossPolicy,
 }
 
@@ -408,6 +412,11 @@ impl TbcConfig {
         {
             return Err(TbcError::InvalidConfig(
                 "this format requires even width".into(),
+            ));
+        }
+        if self.head_switch.lines > 0 && self.head_switch.lines >= self.height {
+            return Err(TbcError::InvalidConfig(
+                "head_switch lines must be smaller than the frame height".into(),
             ));
         }
         if self.buffer_frames == 0 || self.buffer_frames > 240 {
@@ -451,6 +460,7 @@ impl Default for TbcConfig {
             buffer_frames: 8,
             procamp: procamp::ProcAmpConfig::default(),
             jitter_correction: true,
+            head_switch: head_switch::HeadSwitchConfig::default(),
             signal_loss: SignalLossPolicy::LastFrameHold,
         }
     }
@@ -465,6 +475,20 @@ mod tests {
         assert_eq!(PixelFormat::Yuv420p.frame_size(720, 480), 720 * 480 * 3 / 2);
         assert_eq!(PixelFormat::Yuv422p.frame_size(720, 480), 720 * 480 * 2);
         assert_eq!(PixelFormat::Rgb24.frame_size(720, 480), 720 * 480 * 3);
+    }
+
+    #[test]
+    fn validate_rejects_head_switch_covering_the_frame() {
+        // Boundary cases for Issue #29: masking may leave exactly
+        // one clean line, but not zero.
+        let mut c = TbcConfig {
+            height: 10,
+            ..Default::default()
+        };
+        c.head_switch.lines = 9;
+        assert!(c.validate().is_ok());
+        c.head_switch.lines = 10;
+        assert!(c.validate().is_err());
     }
 
     #[test]
