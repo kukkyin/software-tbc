@@ -27,6 +27,10 @@ pub enum StampMode {
 #[derive(Debug, Clone)]
 pub struct CliConfig {
     pub core: TbcConfig,
+    /// Detect the field order at runtime (Issue #26). When true,
+    /// `core.field_order` is the fallback used until (and unless)
+    /// the detector locks onto the stream's real order.
+    pub field_order_auto: bool,
     pub signal_loss_timeout_ms: u64,
     pub telemetry_interval_ms: u64,
     pub max_shift_px: u32,
@@ -42,6 +46,7 @@ impl Default for CliConfig {
     fn default() -> Self {
         CliConfig {
             core: TbcConfig::default(),
+            field_order_auto: false,
             signal_loss_timeout_ms: 200,
             telemetry_interval_ms: 1000,
             max_shift_px: 8,
@@ -62,6 +67,7 @@ struct Overrides {
     height: Option<u32>,
     format: Option<PixelFormat>,
     field_order: Option<FieldOrder>,
+    field_order_auto: Option<bool>,
     target_rate: Option<FrameRate>,
     rate_policy: Option<RatePolicy>,
     buffer_frames: Option<usize>,
@@ -98,6 +104,9 @@ impl Overrides {
         }
         if let Some(v) = self.field_order {
             core.field_order = v;
+        }
+        if let Some(v) = self.field_order_auto {
+            cfg.field_order_auto = v;
         }
         if let Some(v) = self.target_rate {
             core.target_rate = v;
@@ -267,7 +276,7 @@ impl TomlConfig {
             o.format = Some(parse_format(&s)?);
         }
         if let Some(s) = self.field_order {
-            o.field_order = Some(parse_field_order(&s)?);
+            apply_field_order_setting(&mut o, &s)?;
         }
         if let Some(s) = self.target_rate {
             o.target_rate = Some(parse_rate(&s)?);
@@ -305,6 +314,21 @@ pub fn parse_format(s: &str) -> Result<PixelFormat, String> {
             "unknown format '{other}' (expected: yuv420p | yuv422p | rgb24 | uyvy | yuyv)"
         )),
     }
+}
+
+/// Apply one `field_order` setting to a layer of overrides. The
+/// value `auto` (Issue #26) enables runtime detection and leaves the
+/// order itself untouched, so the fallback stays whatever the lower
+/// layers resolved; a concrete order sets the order and disables
+/// auto (an explicit choice always wins over an earlier `auto`).
+fn apply_field_order_setting(o: &mut Overrides, s: &str) -> Result<(), String> {
+    if s == "auto" {
+        o.field_order_auto = Some(true);
+    } else {
+        o.field_order = Some(parse_field_order(s)?);
+        o.field_order_auto = Some(false);
+    }
+    Ok(())
 }
 
 pub fn parse_field_order(s: &str) -> Result<FieldOrder, String> {
@@ -405,6 +429,9 @@ pub fn resolve(args: &Args) -> Result<CliConfig, String> {
     if let Some(s) = &args.format {
         o.format = Some(parse_format(s)?);
     }
+    if let Some(s) = &args.field_order {
+        apply_field_order_setting(&mut o, s)?;
+    }
     if let Some(s) = &args.stamp {
         o.stamp = Some(parse_stamp_mode(s)?);
     }
@@ -436,6 +463,7 @@ mod tests {
             width: None,
             height: None,
             format: None,
+            field_order: None,
             preset: preset.map(str::to_string),
             standard: None,
             config: config.map(str::to_string),
@@ -549,6 +577,48 @@ mod tests {
         let cfg = resolve(&a).expect("resolve");
         assert!(!cfg.overload_fallback);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn field_order_auto_resolution() {
+        // Default: no auto; the fallback is the core default (BFF).
+        let cfg = resolve(&args(None, None)).expect("resolve");
+        assert!(!cfg.field_order_auto);
+        assert_eq!(cfg.core.field_order, FieldOrder::BottomFieldFirst);
+
+        // TOML "auto": detection on, fallback untouched.
+        let dir = std::env::temp_dir().join(format!("software-tbc-cli-fo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("tbc.toml");
+        std::fs::write(&path, "field_order = \"auto\"\n").expect("write toml");
+        let mut a = args(None, path.to_str());
+        let cfg = resolve(&a).expect("resolve");
+        assert!(cfg.field_order_auto);
+        assert_eq!(cfg.core.field_order, FieldOrder::BottomFieldFirst);
+
+        // TOML auto + standard pal: the standard supplies the
+        // fallback (TFF) and auto stays on.
+        a.standard = Some("pal".to_string());
+        let cfg = resolve(&a).expect("resolve");
+        assert!(cfg.field_order_auto);
+        assert_eq!(cfg.core.field_order, FieldOrder::TopFieldFirst);
+
+        // A concrete CLI order beats TOML auto and disables it.
+        a.field_order = Some("bottom-first".to_string());
+        let cfg = resolve(&a).expect("resolve");
+        assert!(!cfg.field_order_auto);
+        assert_eq!(cfg.core.field_order, FieldOrder::BottomFieldFirst);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // CLI auto alone.
+        let mut a = args(None, None);
+        a.field_order = Some("auto".to_string());
+        let cfg = resolve(&a).expect("resolve");
+        assert!(cfg.field_order_auto);
+
+        // Unknown values are errors.
+        a.field_order = Some("sideways".to_string());
+        assert!(resolve(&a).is_err());
     }
 
     #[test]
