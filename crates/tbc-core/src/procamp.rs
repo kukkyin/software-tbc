@@ -26,6 +26,11 @@ pub struct ProcAmpConfig {
     /// delay of composite sources (Issue #30). 0.0 = none. Not
     /// applied to RGB frames.
     pub chroma_shift_px: f32,
+    /// The input is full-range (0..=255) rather than limited-range
+    /// (16..=235): the luma LUT then applies gain around 0 instead
+    /// of around the limited-range pivot (Issue #32). Set by the
+    /// auto-adapt range estimator, not a user control.
+    pub full_range: bool,
 }
 
 impl Default for ProcAmpConfig {
@@ -37,6 +42,7 @@ impl Default for ProcAmpConfig {
             hue_degrees: 0.0,
             gamma: 1.0,
             chroma_shift_px: 0.0,
+            full_range: false,
         }
     }
 }
@@ -50,6 +56,7 @@ impl ProcAmpConfig {
             && self.hue_degrees == 0.0
             && self.gamma == 1.0
             && self.chroma_shift_px == 0.0
+            && !self.full_range
     }
 }
 
@@ -91,8 +98,13 @@ impl ProcAmp {
         let mut luma_lut = [0u8; 256];
         for (i, out) in luma_lut.iter_mut().enumerate() {
             // Limited-range expansion around the 16..235 window, gain,
-            // pedestal, then optional gamma. See SPEC.md §4.4.
-            let mut y = (i as f32 - 16.0) * config.luma_gain + 16.0 + config.pedestal;
+            // pedestal, then optional gamma. See SPEC.md §4.4. For
+            // full-range input the gain pivots at 0 instead (Issue #32).
+            let mut y = if config.full_range {
+                i as f32 * config.luma_gain + config.pedestal
+            } else {
+                (i as f32 - 16.0) * config.luma_gain + 16.0 + config.pedestal
+            };
             if config.gamma != 1.0 {
                 let norm = (y.clamp(0.0, 255.0)) / 255.0;
                 y = 255.0 * norm.powf(1.0 / config.gamma);
@@ -385,6 +397,37 @@ mod tests {
         assert!(f.data[..8].iter().all(|&y| y == 100));
         assert_eq!(&f.data[8..10], [10, 10]);
         assert_eq!(&f.data[10..12], [30, 30]);
+    }
+
+    #[test]
+    fn full_range_lut_pivots_at_zero() {
+        // Gain 1.2 on Y=100: limited pivots at 16 -> 117,
+        // full-range pivots at 0 -> 120 (Issue #32).
+        let limited = ProcAmp::new(ProcAmpConfig {
+            luma_gain: 1.2,
+            ..Default::default()
+        });
+        let mut f = frame(PixelFormat::Yuv422p, vec![100, 128, 100, 128], 2, 1);
+        limited.apply(&mut f);
+        assert_eq!(f.data[0], 117);
+
+        let full = ProcAmp::new(ProcAmpConfig {
+            luma_gain: 1.2,
+            full_range: true,
+            ..Default::default()
+        });
+        let mut f = frame(PixelFormat::Yuv422p, vec![100, 128, 100, 128], 2, 1);
+        full.apply(&mut f);
+        assert_eq!(f.data[0], 120);
+    }
+
+    #[test]
+    fn full_range_only_config_is_not_neutral() {
+        assert!(!ProcAmpConfig {
+            full_range: true,
+            ..Default::default()
+        }
+        .is_neutral());
     }
 
     #[test]
