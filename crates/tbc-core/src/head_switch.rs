@@ -100,6 +100,15 @@ pub fn apply_head_switch(frame: &mut VideoFrame, cfg: &HeadSwitchConfig) {
             conceal_region(u_plane, w / 2, h / 2, chroma_lines, cfg.mode);
             conceal_region(v_plane, w / 2, h / 2, chroma_lines, cfg.mode);
         }
+        PixelFormat::Nv12 => {
+            let y_size = w * h;
+            let (y_plane, uv_plane) = frame.data.split_at_mut(y_size);
+            conceal_region(y_plane, w, h, lines, cfg.mode);
+            // The interleaved chroma plane has half as many rows of
+            // full width; conceal its bottom ceil(N/2) rows.
+            let chroma_lines = lines.div_ceil(2);
+            conceal_region(uv_plane, w, h / 2, chroma_lines, cfg.mode);
+        }
         PixelFormat::Yuv422p | PixelFormat::Uyvy | PixelFormat::Yuyv => {
             conceal_region(&mut frame.data, w * 2, h, lines, cfg.mode);
         }
