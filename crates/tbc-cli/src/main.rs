@@ -53,7 +53,7 @@ pub struct Args {
     #[arg(long)]
     height: Option<u32>,
     /// Pixel format: yuv420p | yuv422p | rgb24 | uyvy | yuyv |
-    /// yuv420p10le | yuv422p10le.
+    /// yuv420p10le | yuv422p10le | nv12.
     #[arg(long)]
     format: Option<String>,
     /// Field order: progressive | top-first | bottom-first | auto
