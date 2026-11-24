@@ -1,0 +1,99 @@
+# Example configuration for software-tbc.
+#
+# Copy this file, adjust the values, and pass it with:
+#
+#   software-tbc --config config.toml --input in.raw --output out.raw
+#
+# Every key is optional. Resolution order (later wins):
+#   defaults -> preset -> this file -> standard -> individual CLI flags
+# The preset (--preset) and standard (--standard) are chosen on the
+# command line or by the defaults below; they are not keys in this file.
+# Unknown keys are rejected, so keep the spelling exactly as shown.
+
+# --- Video geometry and format -------------------------------------------
+# Processing dimensions. The defaults below are NTSC DVD/VHS size.
+width = 720
+height = 480
+
+# Wire format of the input and output data:
+#   yuv420p | yuv422p | rgb24 | uyvy | yuyv
+#   yuv420p10le | yuv422p10le | nv12
+# 10-bit and NV12 are converted to internal 8-bit at the boundary.
+format = "yuv422p"
+
+# Field order: progressive | top-first | bottom-first | auto
+# "auto" detects the order from the first frames of the stream.
+field_order = "bottom-first"
+
+# Output frame rate as a rational string, e.g. "30000/1001" (NTSC),
+# "25/1" (PAL), "60000/1001".
+target_rate = "30000/1001"
+
+# --- Input/output geometry (optional) -------------------------------------
+# Capture cards often deliver extra lines (e.g. 486 for NTSC). Crop the
+# input to the processing size, and/or pad the output afterwards.
+# input_width = 720
+# input_height = 486
+# crop_left = 0
+# crop_top = 6
+# output_width = 720
+# output_height = 480
+# pad_left = 0
+# pad_top = 0
+
+# --- Synchronization -------------------------------------------------------
+# Rate policy when input and output clocks drift apart:
+#   hold-drop | blend
+rate_policy = "hold-drop"
+
+# Frames kept in the synchronisation buffer. Larger values ride out
+# more jitter at the cost of latency (about buffer_frames/2 + 1 frames
+# of processing latency).
+buffer_frames = 8
+
+# Timing stamps: nominal (constant rate) | wall-clock (arrival time).
+# Use wall-clock for live capture; overload_fallback only applies then.
+stamp = "nominal"
+# overload_fallback = true
+
+# --- Correction ------------------------------------------------------------
+# Per-line horizontal jitter correction.
+jitter_correction = true
+# max_shift_px = 8
+
+# Head-switching noise concealment: replace the bottom N lines of each
+# frame (0 = off). Modes: replicate | interpolate.
+# head_switch_lines = 6
+# head_switch_mode = "replicate"
+
+# Source-adaptive correction: classifies the input range (full/limited)
+# and adapts the jitter search range to the source.
+# auto_adapt = false
+
+# --- Signal loss -----------------------------------------------------------
+# Policy while the input signal is invalid:
+#   last-frame-hold | blackout | test-pattern | passthrough
+signal_loss = "last-frame-hold"
+
+# How long (milliseconds) a bad signal is tolerated before the loss
+# policy engages.
+signal_loss_timeout_ms = 200
+
+# --- Telemetry -------------------------------------------------------------
+# Telemetry rows are written to stderr as JSON Lines, or as CSV with a
+# fixed 24-column schema when telemetry_format = "csv".
+telemetry_interval_ms = 1000
+telemetry_format = "json"
+
+# Analysis-only mode: process the input, print one JSON report to
+# stdout, and write no output. Also available as --analyze-only.
+# analyze_only = true
+
+# --- Processing amplifier --------------------------------------------------
+[procamp]
+luma_gain = 1.0        # 1.0 = neutral
+pedestal = 0.0         # black-level offset (IRE-like units)
+saturation = 1.0       # 1.0 = neutral
+hue_degrees = 0.0      # chroma rotation
+gamma = 1.0            # 1.0 = neutral
+chroma_shift_px = 0.0  # chroma delay correction, in luma pixels
