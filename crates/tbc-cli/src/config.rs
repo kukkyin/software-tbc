@@ -267,8 +267,10 @@ pub fn parse_format(s: &str) -> Result<PixelFormat, String> {
         "yuv420p" => Ok(PixelFormat::Yuv420p),
         "yuv422p" => Ok(PixelFormat::Yuv422p),
         "rgb24" => Ok(PixelFormat::Rgb24),
+        "uyvy" => Ok(PixelFormat::Uyvy),
+        "yuyv" => Ok(PixelFormat::Yuyv),
         other => Err(format!(
-            "unknown format '{other}' (expected: yuv420p | yuv422p | rgb24)"
+            "unknown format '{other}' (expected: yuv420p | yuv422p | rgb24 | uyvy | yuyv)"
         )),
     }
 }
@@ -507,6 +509,25 @@ mod tests {
         let cfg = resolve(&a).expect("resolve");
         assert!(!cfg.overload_fallback);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn format_parsing_includes_packed_422() {
+        assert_eq!(parse_format("yuv420p").expect("420"), PixelFormat::Yuv420p);
+        assert_eq!(parse_format("yuv422p").expect("422"), PixelFormat::Yuv422p);
+        assert_eq!(parse_format("rgb24").expect("rgb"), PixelFormat::Rgb24);
+        assert_eq!(parse_format("uyvy").expect("uyvy"), PixelFormat::Uyvy);
+        assert_eq!(parse_format("yuyv").expect("yuyv"), PixelFormat::Yuyv);
+        assert!(parse_format("nv12").is_err());
+
+        // A packed format resolves end to end and validates at even width.
+        let mut a = args(None, None);
+        a.format = Some("uyvy".to_string());
+        let cfg = resolve(&a).expect("resolve");
+        assert_eq!(cfg.core.format, PixelFormat::Uyvy);
+        // ... and is rejected at an odd width.
+        a.width = Some(719);
+        assert!(resolve(&a).is_err());
     }
 
     #[test]
