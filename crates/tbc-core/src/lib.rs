@@ -33,10 +33,18 @@ pub enum TbcError {
 pub enum PixelFormat {
     /// Planar YUV 4:2:0, 8-bit (FFmpeg `yuv420p`).
     Yuv420p,
-    /// Planar YUV 4:2:2, 8-bit (FFmpeg `yuv422p`).
+    /// YUV 4:2:2, 8-bit, in the pipeline's packed byte order
+    /// (Y0 Cb Y1 Cr quads; see Issue #23's note in SPEC.md §3).
     Yuv422p,
     /// Packed RGB, 8-bit per channel (FFmpeg `rgb24`).
     Rgb24,
+    /// Packed YUV 4:2:2, 8-bit, U-Y-V-Y byte order (FFmpeg `uyvy422`).
+    /// Carried at the I/O boundary and converted to `Yuv422p` for
+    /// processing (Issue #23).
+    Uyvy,
+    /// Packed YUV 4:2:2, 8-bit, Y-U-Y-V byte order (FFmpeg `yuyv422`).
+    /// Same boundary role as `Uyvy`.
+    Yuyv,
 }
 
 impl PixelFormat {
@@ -45,9 +53,15 @@ impl PixelFormat {
         let px = (width * height) as usize;
         match self {
             PixelFormat::Yuv420p => px * 3 / 2,
-            PixelFormat::Yuv422p => px * 2,
+            PixelFormat::Yuv422p | PixelFormat::Uyvy | PixelFormat::Yuyv => px * 2,
             PixelFormat::Rgb24 => px * 3,
         }
+    }
+
+    /// Whether this format packs two pixels into one 4-byte group and
+    /// therefore requires an even width.
+    pub fn is_packed_422(self) -> bool {
+        matches!(self, PixelFormat::Uyvy | PixelFormat::Yuyv)
     }
 }
 
@@ -118,6 +132,75 @@ impl VideoFrame {
         }
         Ok(())
     }
+
+    /// Convert a packed 4:2:2 frame (`Uyvy` / `Yuyv`) into the
+    /// pipeline's `Yuv422p` representation (Issue #23). Both packed
+    /// formats share 4:2:2 sampling with `Yuv422p`, so this is a pure
+    /// byte reorder: `Yuyv` already uses the same byte order and only
+    /// changes its tag, while `Uyvy` swaps the bytes of each 4-byte
+    /// group. A `Yuv422p` frame converts to a copy of itself; any
+    /// other format is an error. Exactly reversible by
+    /// [`VideoFrame::from_yuv422p`].
+    pub fn to_yuv422p(&self) -> Result<VideoFrame, TbcError> {
+        self.validate()?;
+        match self.format {
+            PixelFormat::Yuv422p => Ok(self.clone()),
+            PixelFormat::Yuyv => {
+                let mut frame = self.clone();
+                frame.format = PixelFormat::Yuv422p;
+                Ok(frame)
+            }
+            PixelFormat::Uyvy => {
+                let mut frame = self.clone();
+                swap_422_quads(&mut frame.data);
+                frame.format = PixelFormat::Yuv422p;
+                Ok(frame)
+            }
+            other => Err(TbcError::InvalidConfig(format!(
+                "cannot convert {other:?} to yuv422p"
+            ))),
+        }
+    }
+
+    /// Inverse of [`VideoFrame::to_yuv422p`]: re-pack a `Yuv422p`
+    /// frame into the boundary format `format` (`Uyvy` or `Yuyv`;
+    /// `Yuv422p` returns a copy). Any other combination is an error.
+    pub fn from_yuv422p(frame: &VideoFrame, format: PixelFormat) -> Result<VideoFrame, TbcError> {
+        if frame.format != PixelFormat::Yuv422p {
+            return Err(TbcError::InvalidConfig(format!(
+                "from_yuv422p needs a yuv422p source, got {:?}",
+                frame.format
+            )));
+        }
+        frame.validate()?;
+        match format {
+            PixelFormat::Yuv422p => Ok(frame.clone()),
+            PixelFormat::Yuyv => {
+                let mut out = frame.clone();
+                out.format = PixelFormat::Yuyv;
+                Ok(out)
+            }
+            PixelFormat::Uyvy => {
+                let mut out = frame.clone();
+                swap_422_quads(&mut out.data);
+                out.format = PixelFormat::Uyvy;
+                Ok(out)
+            }
+            other => Err(TbcError::InvalidConfig(format!(
+                "cannot convert yuv422p to {other:?}"
+            ))),
+        }
+    }
+}
+
+/// Reorder each 4-byte group of packed 4:2:2 data between the
+/// U-Y-V-Y and Y-U-Y-V orders (the operation is its own inverse):
+/// `[a, b, c, d]` becomes `[b, a, d, c]`.
+pub(crate) fn swap_422_quads(data: &mut [u8]) {
+    for quad in data.chunks_exact_mut(4) {
+        quad.swap(0, 1);
+        quad.swap(2, 3);
+    }
 }
 
 /// What to do when the output clock needs a frame but none is due.
@@ -169,6 +252,11 @@ impl TbcConfig {
         if self.format == PixelFormat::Yuv420p && (self.width % 2 == 1 || self.height % 2 == 1) {
             return Err(TbcError::InvalidConfig(
                 "yuv420p requires even width and height".into(),
+            ));
+        }
+        if self.format.is_packed_422() && self.width % 2 == 1 {
+            return Err(TbcError::InvalidConfig(
+                "uyvy/yuyv require even width".into(),
             ));
         }
         if self.buffer_frames == 0 || self.buffer_frames > 240 {
@@ -294,5 +382,114 @@ mod tests {
     fn ntsc_frame_duration_is_1001_based() {
         // 29.97 fps -> 33.3667 ms per frame (integer division truncates).
         assert_eq!(FrameRate::NTSC_29_97.frame_duration_ns(), 33_366_666);
+    }
+
+    fn frame_with(format: PixelFormat, data: Vec<u8>, width: u32, height: u32) -> VideoFrame {
+        VideoFrame {
+            width,
+            height,
+            format,
+            field_order: FieldOrder::Progressive,
+            pts_ns: 0,
+            sequence: 0,
+            data,
+        }
+    }
+
+    #[test]
+    fn packed_422_frame_size_and_validation() {
+        assert_eq!(PixelFormat::Uyvy.frame_size(720, 480), 720 * 480 * 2);
+        assert_eq!(PixelFormat::Yuyv.frame_size(720, 480), 720 * 480 * 2);
+        // Odd widths are invalid for the packed formats only.
+        for format in [PixelFormat::Uyvy, PixelFormat::Yuyv] {
+            let c = TbcConfig {
+                format,
+                width: 719,
+                ..Default::default()
+            };
+            assert!(matches!(c.validate(), Err(TbcError::InvalidConfig(_))));
+            let c = TbcConfig {
+                format,
+                width: 720,
+                ..Default::default()
+            };
+            assert!(c.validate().is_ok());
+        }
+    }
+
+    #[test]
+    fn uyvy_conversion_reorders_quads() {
+        // Two pixel pairs: (U=10, Y0=20, V=30, Y1=40), (U=50, Y0=60, V=70, Y1=80).
+        let uyvy = frame_with(
+            PixelFormat::Uyvy,
+            vec![10, 20, 30, 40, 50, 60, 70, 80],
+            4,
+            1,
+        );
+        let converted = uyvy.to_yuv422p().expect("convert");
+        assert_eq!(converted.format, PixelFormat::Yuv422p);
+        assert_eq!(converted.data, vec![20, 10, 40, 30, 60, 50, 80, 70]);
+        // And back.
+        let back = VideoFrame::from_yuv422p(&converted, PixelFormat::Uyvy).expect("re-pack");
+        assert_eq!(back.format, PixelFormat::Uyvy);
+        assert_eq!(back.data, uyvy.data);
+    }
+
+    #[test]
+    fn yuyv_conversion_is_a_retag() {
+        let yuyv = frame_with(
+            PixelFormat::Yuyv,
+            vec![20, 10, 40, 30, 60, 50, 80, 70],
+            4,
+            1,
+        );
+        let converted = yuyv.to_yuv422p().expect("convert");
+        assert_eq!(converted.format, PixelFormat::Yuv422p);
+        assert_eq!(converted.data, yuyv.data);
+        let back = VideoFrame::from_yuv422p(&converted, PixelFormat::Yuyv).expect("re-pack");
+        assert_eq!(back.format, PixelFormat::Yuyv);
+        assert_eq!(back.data, yuyv.data);
+    }
+
+    #[test]
+    fn packed_round_trip_is_identity_on_a_full_frame() {
+        // Deterministic byte pattern over a whole 64x64 frame.
+        let data: Vec<u8> = (0..PixelFormat::Uyvy.frame_size(64, 64))
+            .map(|i| (i * 37 % 251) as u8)
+            .collect();
+        for format in [PixelFormat::Uyvy, PixelFormat::Yuyv] {
+            let frame = frame_with(format, data.clone(), 64, 64);
+            let converted = frame.to_yuv422p().expect("convert");
+            let back = VideoFrame::from_yuv422p(&converted, format).expect("re-pack");
+            assert_eq!(back.data, data, "round trip for {format:?}");
+        }
+    }
+
+    #[test]
+    fn conversion_rejects_other_formats() {
+        let rgb = frame_with(PixelFormat::Rgb24, vec![0; 4 * 4 * 3], 4, 4);
+        assert!(rgb.to_yuv422p().is_err());
+        let yuv420 = frame_with(
+            PixelFormat::Yuv420p,
+            vec![0; PixelFormat::Yuv420p.frame_size(4, 4)],
+            4,
+            4,
+        );
+        assert!(VideoFrame::from_yuv422p(&yuv420, PixelFormat::Uyvy).is_err());
+        let yuv422 = frame_with(PixelFormat::Yuv422p, vec![0; 4 * 4 * 2], 4, 4);
+        assert!(VideoFrame::from_yuv422p(&yuv422, PixelFormat::Rgb24).is_err());
+        // A yuv422p frame converts to itself.
+        let same = yuv422.to_yuv422p().expect("identity");
+        assert_eq!(same.data, yuv422.data);
+    }
+
+    #[test]
+    fn conversion_rejects_size_mismatch() {
+        // Boundary case: a packed frame whose buffer is too short.
+        let short = frame_with(PixelFormat::Uyvy, vec![0; 6], 4, 1);
+        assert!(matches!(
+            short.to_yuv422p(),
+            Err(TbcError::FrameSizeMismatch { .. })
+        ));
     }
 }
