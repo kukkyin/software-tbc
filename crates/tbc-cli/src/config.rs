@@ -9,6 +9,20 @@ use tbc_core::{FieldOrder, FrameRate, PixelFormat, RatePolicy, SignalLossPolicy,
 
 use crate::Args;
 
+/// How the reader thread synthesizes input timestamps (Issue #20).
+/// Raw streams carry no timestamps of their own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StampMode {
+    /// pts = sequence x nominal frame duration. Deterministic; the
+    /// right choice for file input and tests.
+    Nominal,
+    /// pts = arrival time relative to the first frame. Lets the
+    /// synchronizer see a live source's real clock drift and arrival
+    /// jitter; meaningless for sequence input (files have no arrival
+    /// time), where resolution falls back to `Nominal` with a warning.
+    WallClock,
+}
+
 /// Fully resolved configuration for one run.
 #[derive(Debug, Clone)]
 pub struct CliConfig {
@@ -16,6 +30,7 @@ pub struct CliConfig {
     pub signal_loss_timeout_ms: u64,
     pub telemetry_interval_ms: u64,
     pub max_shift_px: u32,
+    pub stamp: StampMode,
     pub input: String,
     pub output: String,
     pub max_frames: Option<u64>,
@@ -29,6 +44,7 @@ impl Default for CliConfig {
             signal_loss_timeout_ms: 200,
             telemetry_interval_ms: 1000,
             max_shift_px: 8,
+            stamp: StampMode::Nominal,
             input: "-".to_string(),
             output: "-".to_string(),
             max_frames: None,
@@ -52,6 +68,7 @@ struct Overrides {
     signal_loss_timeout_ms: Option<u64>,
     telemetry_interval_ms: Option<u64>,
     max_shift_px: Option<u32>,
+    stamp: Option<StampMode>,
     procamp: ProcampOverrides,
 }
 
@@ -102,6 +119,9 @@ impl Overrides {
         }
         if let Some(v) = self.max_shift_px {
             cfg.max_shift_px = v;
+        }
+        if let Some(v) = self.stamp {
+            cfg.stamp = v;
         }
         let p = &mut core.procamp;
         if let Some(v) = self.procamp.luma_gain {
@@ -173,6 +193,7 @@ struct TomlConfig {
     signal_loss_timeout_ms: Option<u64>,
     telemetry_interval_ms: Option<u64>,
     max_shift_px: Option<u32>,
+    stamp: Option<String>,
     procamp: Option<TomlProcamp>,
 }
 
@@ -212,6 +233,9 @@ impl TomlConfig {
         }
         if let Some(s) = self.signal_loss {
             o.signal_loss = Some(parse_signal_loss(&s)?);
+        }
+        if let Some(s) = self.stamp {
+            o.stamp = Some(parse_stamp_mode(&s)?);
         }
         if let Some(p) = self.procamp {
             o.procamp = ProcampOverrides {
@@ -282,6 +306,16 @@ pub fn parse_rate_policy(s: &str) -> Result<RatePolicy, String> {
     }
 }
 
+pub fn parse_stamp_mode(s: &str) -> Result<StampMode, String> {
+    match s {
+        "nominal" => Ok(StampMode::Nominal),
+        "wall-clock" => Ok(StampMode::WallClock),
+        other => Err(format!(
+            "unknown stamp mode '{other}' (expected: nominal | wall-clock)"
+        )),
+    }
+}
+
 pub fn parse_signal_loss(s: &str) -> Result<SignalLossPolicy, String> {
     match s {
         "last-frame-hold" => Ok(SignalLossPolicy::LastFrameHold),
@@ -318,6 +352,9 @@ pub fn resolve(args: &Args) -> Result<CliConfig, String> {
     if let Some(s) = &args.format {
         o.format = Some(parse_format(s)?);
     }
+    if let Some(s) = &args.stamp {
+        o.stamp = Some(parse_stamp_mode(s)?);
+    }
     o.apply_to(&mut cfg);
 
     cfg.input = args.input.clone();
@@ -344,6 +381,7 @@ mod tests {
             format: None,
             preset: preset.map(str::to_string),
             config: config.map(str::to_string),
+            stamp: None,
             max_frames: None,
             fail_on_signal_loss: false,
         }
@@ -396,6 +434,35 @@ mod tests {
         let cfg = resolve(&a).expect("resolve");
         assert_eq!(cfg.core.width, 352);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stamp_mode_defaults_to_nominal_and_layers_apply() {
+        // Default: nominal.
+        let cfg = resolve(&args(None, None)).expect("resolve");
+        assert_eq!(cfg.stamp, StampMode::Nominal);
+
+        // TOML sets wall-clock.
+        let dir =
+            std::env::temp_dir().join(format!("software-tbc-cli-stamp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("tbc.toml");
+        std::fs::write(&path, "stamp = \"wall-clock\"\n").expect("write toml");
+        let mut a = args(None, path.to_str());
+        let cfg = resolve(&a).expect("resolve");
+        assert_eq!(cfg.stamp, StampMode::WallClock);
+
+        // CLI beats TOML.
+        a.stamp = Some("nominal".to_string());
+        let cfg = resolve(&a).expect("resolve");
+        assert_eq!(cfg.stamp, StampMode::Nominal);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Unknown values are errors in both layers.
+        let mut a = args(None, None);
+        a.stamp = Some("realtime".to_string());
+        assert!(resolve(&a).is_err());
+        assert!(parse_stamp_mode("realtime").is_err());
     }
 
     #[test]
