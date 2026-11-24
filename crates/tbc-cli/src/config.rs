@@ -28,6 +28,21 @@ pub enum StampMode {
 #[derive(Debug, Clone)]
 pub struct CliConfig {
     pub core: TbcConfig,
+    /// Geometry separation (Issue #31): `core.width/height` is the
+    /// processing (active-area) size. The input size defaults to
+    /// the processing size; a 0 here means "follow the processing
+    /// size" and is resolved before use.
+    pub input_width: u32,
+    pub input_height: u32,
+    /// Origin of the processing window inside the input frame.
+    pub crop_left: u32,
+    pub crop_top: u32,
+    /// Output size; 0 means "follow the processing size".
+    pub output_width: u32,
+    pub output_height: u32,
+    /// Position of the processed frame inside the output frame.
+    pub pad_left: u32,
+    pub pad_top: u32,
     /// Detect the field order at runtime (Issue #26). When true,
     /// `core.field_order` is the fallback used until (and unless)
     /// the detector locks onto the stream's real order.
@@ -47,6 +62,14 @@ impl Default for CliConfig {
     fn default() -> Self {
         CliConfig {
             core: TbcConfig::default(),
+            input_width: 0,
+            input_height: 0,
+            crop_left: 0,
+            crop_top: 0,
+            output_width: 0,
+            output_height: 0,
+            pad_left: 0,
+            pad_top: 0,
             field_order_auto: false,
             signal_loss_timeout_ms: 200,
             telemetry_interval_ms: 1000,
@@ -66,6 +89,14 @@ impl Default for CliConfig {
 struct Overrides {
     width: Option<u32>,
     height: Option<u32>,
+    input_width: Option<u32>,
+    input_height: Option<u32>,
+    crop_left: Option<u32>,
+    crop_top: Option<u32>,
+    output_width: Option<u32>,
+    output_height: Option<u32>,
+    pad_left: Option<u32>,
+    pad_top: Option<u32>,
     format: Option<PixelFormat>,
     field_order: Option<FieldOrder>,
     field_order_auto: Option<bool>,
@@ -102,6 +133,30 @@ impl Overrides {
         }
         if let Some(v) = self.height {
             core.height = v;
+        }
+        if let Some(v) = self.input_width {
+            cfg.input_width = v;
+        }
+        if let Some(v) = self.input_height {
+            cfg.input_height = v;
+        }
+        if let Some(v) = self.crop_left {
+            cfg.crop_left = v;
+        }
+        if let Some(v) = self.crop_top {
+            cfg.crop_top = v;
+        }
+        if let Some(v) = self.output_width {
+            cfg.output_width = v;
+        }
+        if let Some(v) = self.output_height {
+            cfg.output_height = v;
+        }
+        if let Some(v) = self.pad_left {
+            cfg.pad_left = v;
+        }
+        if let Some(v) = self.pad_top {
+            cfg.pad_top = v;
         }
         if let Some(v) = self.format {
             core.format = v;
@@ -247,6 +302,14 @@ fn parse_standard(name: &str) -> Result<Overrides, String> {
 struct TomlConfig {
     width: Option<u32>,
     height: Option<u32>,
+    input_width: Option<u32>,
+    input_height: Option<u32>,
+    crop_left: Option<u32>,
+    crop_top: Option<u32>,
+    output_width: Option<u32>,
+    output_height: Option<u32>,
+    pad_left: Option<u32>,
+    pad_top: Option<u32>,
     format: Option<String>,
     field_order: Option<String>,
     target_rate: Option<String>,
@@ -280,6 +343,14 @@ impl TomlConfig {
         let mut o = Overrides {
             width: self.width,
             height: self.height,
+            input_width: self.input_width,
+            input_height: self.input_height,
+            crop_left: self.crop_left,
+            crop_top: self.crop_top,
+            output_width: self.output_width,
+            output_height: self.output_height,
+            pad_left: self.pad_left,
+            pad_top: self.pad_top,
             buffer_frames: self.buffer_frames,
             jitter_correction: self.jitter_correction,
             head_switch_lines: self.head_switch_lines,
@@ -465,6 +536,30 @@ pub fn resolve(args: &Args) -> Result<CliConfig, String> {
     if let Some(s) = &args.field_order {
         apply_field_order_setting(&mut o, s)?;
     }
+    if let Some(v) = args.input_width {
+        o.input_width = Some(v);
+    }
+    if let Some(v) = args.input_height {
+        o.input_height = Some(v);
+    }
+    if let Some(v) = args.crop_left {
+        o.crop_left = Some(v);
+    }
+    if let Some(v) = args.crop_top {
+        o.crop_top = Some(v);
+    }
+    if let Some(v) = args.output_width {
+        o.output_width = Some(v);
+    }
+    if let Some(v) = args.output_height {
+        o.output_height = Some(v);
+    }
+    if let Some(v) = args.pad_left {
+        o.pad_left = Some(v);
+    }
+    if let Some(v) = args.pad_top {
+        o.pad_top = Some(v);
+    }
     if let Some(v) = args.head_switch_lines {
         o.head_switch_lines = Some(v);
     }
@@ -488,7 +583,99 @@ pub fn resolve(args: &Args) -> Result<CliConfig, String> {
     cfg.core
         .validate()
         .map_err(|e| format!("invalid configuration: {e}"))?;
+
+    // Geometry (Issue #31): unset input/output sizes follow the
+    // resolved processing size.
+    if cfg.input_width == 0 {
+        cfg.input_width = cfg.core.width;
+    }
+    if cfg.input_height == 0 {
+        cfg.input_height = cfg.core.height;
+    }
+    if cfg.output_width == 0 {
+        cfg.output_width = cfg.core.width;
+    }
+    if cfg.output_height == 0 {
+        cfg.output_height = cfg.core.height;
+    }
+    validate_geometry(&cfg)?;
     Ok(cfg)
+}
+
+/// Validate the separated input/processing/output geometry
+/// (Issue #31): windows must fit, and offsets must keep chroma
+/// sample alignment for the wire format's subsampling class.
+fn validate_geometry(cfg: &CliConfig) -> Result<(), String> {
+    let invalid = |msg: String| format!("invalid configuration: {msg}");
+    // Even-dimension rules for a frame size in this format.
+    let check_size = |w: u32, h: u32, what: &str| -> Result<(), String> {
+        match cfg.core.format {
+            PixelFormat::Yuv420p | PixelFormat::Yuv420p10 if w % 2 == 1 || h % 2 == 1 => {
+                Err(invalid(format!(
+                    "{what} {w}x{h} must be even in both dimensions for 4:2:0"
+                )))
+            }
+            PixelFormat::Yuv422p10 | PixelFormat::Uyvy | PixelFormat::Yuyv if w % 2 == 1 => {
+                Err(invalid(format!(
+                    "{what} width {w} must be even for packed/planar 4:2:2"
+                )))
+            }
+            _ => Ok(()),
+        }
+    };
+    check_size(cfg.input_width, cfg.input_height, "input size")?;
+    check_size(cfg.output_width, cfg.output_height, "output size")?;
+    // Offset parity: 4:2:0 subsamples chroma on both axes, the
+    // packed/4:2:2 family horizontally only, RGB not at all.
+    let check_offsets = |left: u32, top: u32, what: &str| -> Result<(), String> {
+        match cfg.core.format {
+            PixelFormat::Yuv420p | PixelFormat::Yuv420p10 if left % 2 == 1 || top % 2 == 1 => {
+                Err(invalid(format!(
+                    "{what} offsets {left},{top} must be even for 4:2:0"
+                )))
+            }
+            PixelFormat::Yuv422p
+            | PixelFormat::Yuv422p10
+            | PixelFormat::Uyvy
+            | PixelFormat::Yuyv
+                if left % 2 == 1 =>
+            {
+                Err(invalid(format!(
+                    "{what} left offset {left} must be even for 4:2:2"
+                )))
+            }
+            _ => Ok(()),
+        }
+    };
+    check_offsets(cfg.crop_left, cfg.crop_top, "crop")?;
+    check_offsets(cfg.pad_left, cfg.pad_top, "pad")?;
+    if cfg.crop_left as u64 + cfg.core.width as u64 > cfg.input_width as u64
+        || cfg.crop_top as u64 + cfg.core.height as u64 > cfg.input_height as u64
+    {
+        return Err(invalid(format!(
+            "crop window at {},{} of {}x{} does not fit in input {}x{}",
+            cfg.crop_left,
+            cfg.crop_top,
+            cfg.core.width,
+            cfg.core.height,
+            cfg.input_width,
+            cfg.input_height
+        )));
+    }
+    if cfg.pad_left as u64 + cfg.core.width as u64 > cfg.output_width as u64
+        || cfg.pad_top as u64 + cfg.core.height as u64 > cfg.output_height as u64
+    {
+        return Err(invalid(format!(
+            "processed {}x{} at pad {},{} does not fit in output {}x{}",
+            cfg.core.width,
+            cfg.core.height,
+            cfg.pad_left,
+            cfg.pad_top,
+            cfg.output_width,
+            cfg.output_height
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -501,6 +688,14 @@ mod tests {
             output: "-".into(),
             width: None,
             height: None,
+            input_width: None,
+            input_height: None,
+            crop_left: None,
+            crop_top: None,
+            output_width: None,
+            output_height: None,
+            pad_left: None,
+            pad_top: None,
             format: None,
             field_order: None,
             head_switch_lines: None,
@@ -534,6 +729,63 @@ mod tests {
     #[test]
     fn unknown_preset_is_an_error() {
         assert!(resolve(&args(Some("betamax"), None)).is_err());
+    }
+
+    #[test]
+    fn geometry_defaults_follow_processing_size() {
+        let mut a = args(None, None);
+        a.width = Some(352);
+        let cfg = resolve(&a).expect("resolve");
+        assert_eq!((cfg.input_width, cfg.input_height), (352, 480));
+        assert_eq!((cfg.output_width, cfg.output_height), (352, 480));
+        assert_eq!(
+            (cfg.crop_left, cfg.crop_top, cfg.pad_left, cfg.pad_top),
+            (0, 0, 0, 0)
+        );
+    }
+
+    #[test]
+    fn geometry_toml_and_cli_layers_resolve() {
+        let dir =
+            std::env::temp_dir().join(format!("software-tbc-cli-geom-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("tbc.toml");
+        std::fs::write(
+            &path,
+            "input_width = 720\ninput_height = 486\ncrop_top = 6\noutput_width = 728\npad_left = 4\n",
+        )
+        .expect("write toml");
+        let mut a = args(None, path.to_str());
+        a.crop_top = Some(4); // CLI beats TOML.
+        let cfg = resolve(&a).expect("resolve");
+        assert_eq!((cfg.input_width, cfg.input_height), (720, 486));
+        assert_eq!(cfg.crop_top, 4);
+        assert_eq!((cfg.output_width, cfg.pad_left), (728, 4));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn geometry_window_overflow_is_an_error() {
+        // Crop window taller than the input.
+        let mut a = args(None, None);
+        a.input_height = Some(240);
+        assert!(resolve(&a).is_err());
+        // Pad window wider than the output.
+        let mut a = args(None, None);
+        a.output_width = Some(724);
+        a.pad_left = Some(8);
+        assert!(resolve(&a).is_err());
+    }
+
+    #[test]
+    fn geometry_odd_offsets_are_an_error_for_422() {
+        let mut a = args(None, None);
+        a.input_width = Some(726);
+        a.crop_left = Some(3);
+        assert!(resolve(&a).is_err());
+        // Even offsets are fine.
+        a.crop_left = Some(2);
+        assert!(resolve(&a).is_ok());
     }
 
     #[test]
