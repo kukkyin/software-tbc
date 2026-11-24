@@ -183,6 +183,12 @@ observed luma range:
 software-tbc --analyze-only --input capture.raw --width 720 --height 480 --format yuv422p
 ```
 
+Example output (a synthetic test pattern, 30 frames):
+
+```json
+{"type":"analysis","width":720,"height":480,"format":"yuv422p","runtime_s":3.598,"frames_in":30,"frames_out":30,"dropped_frames":0,"duplicated_frames":0,"signal_present":true,"signal_loss_events":0,"signal_lost_ms":0,"drift_ppm":0,"drift_valid":true,"jitter_samples":13920,"jitter_frames":29,"jitter_unestimated_frames":1,"jitter_bypassed_frames":0,"jitter_mean_abs_px":2.931,"jitter_mean_signed_px":-2.931,"jitter_max_abs_px":3.098,"luma_min":0,"luma_max":255,"range_class":"limited"}
+```
+
 Exit code is 0 when a signal is present at the end, 4 when the
 stream ends without one (or the input is empty).
 
