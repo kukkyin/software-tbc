@@ -166,6 +166,10 @@ pub enum TbcError { FrameSizeMismatch{..}, InvalidConfig(String), SignalLost }
 - 彩度・色相: 色差平面で回転＋スケール:
   `Cb' = (Cb-128)*sat*cos(h) - (Cr-128)*sat*sin(h) + 128`
   `Cr' = (Cb-128)*sat*sin(h) + (Cr-128)*sat*cos(h) + 128`
+- クロマシフト（Issue #30）: `chroma_shift_px` で色差を輝度に対して水平に
+  サブピクセル移動し、コンポジット系ソースの色遅延（色ズレ）を補正する。
+  色差サンプル列を線形補間でシフト（端はクランプ）、回転・スケールの前に適用。
+  RGB 入力には適用しない。
 - RGB入力時は YCbCr 変換行列（BT.601、限定レンジ）を前段に挿入し、出力時に逆変換する。
   変換式は ITU-R BT.601 の係数を固定小数点（小数部8bit）で実装する。
 
@@ -308,6 +312,7 @@ pedestal = 0.0
 saturation = 1.0
 hue_degrees = 0.0
 gamma = 1.0
+chroma_shift_px = 0.0           # 色差の水平シフト（輝度px単位、§4.4）
 ```
 
 プリセット（`--preset`）:
