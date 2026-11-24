@@ -31,6 +31,7 @@ pub struct CliConfig {
     pub telemetry_interval_ms: u64,
     pub max_shift_px: u32,
     pub stamp: StampMode,
+    pub overload_fallback: bool,
     pub input: String,
     pub output: String,
     pub max_frames: Option<u64>,
@@ -45,6 +46,7 @@ impl Default for CliConfig {
             telemetry_interval_ms: 1000,
             max_shift_px: 8,
             stamp: StampMode::Nominal,
+            overload_fallback: true,
             input: "-".to_string(),
             output: "-".to_string(),
             max_frames: None,
@@ -69,6 +71,7 @@ struct Overrides {
     telemetry_interval_ms: Option<u64>,
     max_shift_px: Option<u32>,
     stamp: Option<StampMode>,
+    overload_fallback: Option<bool>,
     procamp: ProcampOverrides,
 }
 
@@ -123,6 +126,9 @@ impl Overrides {
         if let Some(v) = self.stamp {
             cfg.stamp = v;
         }
+        if let Some(v) = self.overload_fallback {
+            cfg.overload_fallback = v;
+        }
         let p = &mut core.procamp;
         if let Some(v) = self.procamp.luma_gain {
             p.luma_gain = v;
@@ -167,6 +173,10 @@ fn preset(name: &str) -> Result<Overrides, String> {
             o.buffer_frames = Some(2);
             o.rate_policy = Some(RatePolicy::HoldDrop);
             o.jitter_correction = Some(false);
+            // Already at the lightest settings (no jitter, hold/drop),
+            // so the overload ladder has no stages left here; the flag
+            // is set explicitly to document the intent (Issue #21).
+            o.overload_fallback = Some(true);
         }
         other => {
             return Err(format!(
@@ -194,6 +204,7 @@ struct TomlConfig {
     telemetry_interval_ms: Option<u64>,
     max_shift_px: Option<u32>,
     stamp: Option<String>,
+    overload_fallback: Option<bool>,
     procamp: Option<TomlProcamp>,
 }
 
@@ -217,6 +228,7 @@ impl TomlConfig {
             signal_loss_timeout_ms: self.signal_loss_timeout_ms,
             telemetry_interval_ms: self.telemetry_interval_ms,
             max_shift_px: self.max_shift_px,
+            overload_fallback: self.overload_fallback,
             ..Default::default()
         };
         if let Some(s) = self.format {
@@ -357,6 +369,10 @@ pub fn resolve(args: &Args) -> Result<CliConfig, String> {
     }
     o.apply_to(&mut cfg);
 
+    if args.no_overload_fallback {
+        cfg.overload_fallback = false;
+    }
+
     cfg.input = args.input.clone();
     cfg.output = args.output.clone();
     cfg.max_frames = args.max_frames;
@@ -382,6 +398,7 @@ mod tests {
             preset: preset.map(str::to_string),
             config: config.map(str::to_string),
             stamp: None,
+            no_overload_fallback: false,
             max_frames: None,
             fail_on_signal_loss: false,
         }
@@ -463,6 +480,33 @@ mod tests {
         a.stamp = Some("realtime".to_string());
         assert!(resolve(&a).is_err());
         assert!(parse_stamp_mode("realtime").is_err());
+    }
+
+    #[test]
+    fn overload_fallback_layers() {
+        // Default: enabled.
+        let cfg = resolve(&args(None, None)).expect("resolve");
+        assert!(cfg.overload_fallback);
+
+        // The low-latency preset sets it explicitly.
+        let cfg = resolve(&args(Some("low-latency"), None)).expect("resolve");
+        assert!(cfg.overload_fallback);
+
+        // TOML can disable it.
+        let dir = std::env::temp_dir().join(format!("software-tbc-cli-fb-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("tbc.toml");
+        std::fs::write(&path, "overload_fallback = false\n").expect("write toml");
+        let mut a = args(None, path.to_str());
+        let cfg = resolve(&a).expect("resolve");
+        assert!(!cfg.overload_fallback);
+
+        // The CLI kill switch wins over a TOML that enables it.
+        std::fs::write(&path, "overload_fallback = true\n").expect("write toml");
+        a.no_overload_fallback = true;
+        let cfg = resolve(&a).expect("resolve");
+        assert!(!cfg.overload_fallback);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
