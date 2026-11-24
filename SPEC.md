@@ -221,6 +221,25 @@ VHS 等でフレーム下部に現れるヘッドスイッチングノイズを�
 色差のサブサンプリングに合わせ、4:2:0 では両方向とも偶数、4:2:2 系では left が
 偶数（RGB は無制約）。違反は設定エラー（終了コード 2）。
 
+### 4.9 自動適応（`adapt.rs`）
+
+`auto_adapt` 有効時、2つの低速な制御ループがソースに追随する（Issue #32）。
+どちらも変化率クランプを持ち、暴走しない。
+
+- 輝度レンジ推定（`RangeEstimator`）: 同期後・プロックアンプ前のフレームの
+  輝度 min/max を観測し、30 フレームのウィンドウ単位で投票する
+  （full の証拠: min <= 6 または max >= 249 / limited の証拠: min >= 10 かつ
+  max <= 245）。分類（初期値 limited）は同じ側の投票が3ウィンドウ連続した
+  ときだけ切り替わり、`ProcAmpConfig.full_range` を介して LUT のゲイン基準点
+  （16 基準 / 0 基準）を切り替える。
+- ジッタ探索範囲の適応（`JitterAdapter`）: 推定シフト列を観測し、30 フレーム
+  ごとに、ラインの 5% 超が探索境界に張り付いていれば範囲を +2px 広げ、
+  最大 |シフト| が現範囲の 1/4 未満なら -2px 狭める。範囲は [2, 32] px に
+  制限し、`JitterDetector::set_max_shift_px` で適用する。
+
+切り替わりは stderr に通知する。無効時は推定器・適応器を生成せず、
+従来動作と完全に一致する。
+
 ## 5. メモリ・パフォーマンス設計
 
 - **事前確保**: 起動時に `buffer_frames + 2` 枚分のフレームバッファをプールとして確保し、
@@ -258,7 +277,7 @@ CLI（`tbc-cli`、バイナリ名 `software-tbc`）:
 - 引数: `--input`（`-`=stdin）、`--output`（`-`=stdout）、`--width/--height/--format`、
   `--preset`、`--config`（TOML）、`--stamp nominal|wall-clock`、`--standard ntsc|pal|1080i`、
   `--field-order progressive|top-first|bottom-first|auto`、
-  `--head-switch-lines N`、`--head-switch-mode replicate|interpolate`、
+  `--head-switch-lines N`、`--head-switch-mode replicate|interpolate`、`--auto-adapt`、
   幾何分離（§4.8）: `--input-width/--input-height`、`--crop-left/--crop-top`、
   `--output-width/--output-height`、`--pad-left/--pad-top`。
   優先順位: CLI引数 > 設定ファイル > プリセット > 既定値。
@@ -327,6 +346,7 @@ signal_loss = "last-frame-hold" # last-frame-hold | blackout | test-pattern
 signal_loss_timeout_ms = 200
 telemetry_interval_ms = 1000
 stamp = "nominal"               # nominal | wall-clock（§6、Issue #20）
+auto_adapt = false              # 自動適応（§4.9、Issue #32）
 
 [procamp]
 luma_gain = 1.0
