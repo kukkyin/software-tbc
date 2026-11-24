@@ -99,8 +99,9 @@ pub enum TbcError { FrameSizeMismatch{..}, InvalidConfig(String), SignalLost }
 
 ## 4. コア処理パイプライン（tbc-core）
 
-処理順序は固定: **取り込み → リングバッファ → レート整列 → ラインジッタ補正 →
-フィールド処理 → プロックアンプ → ガード（信号断検出）→ 出力**。
+処理順序は固定: **取り込み → リングバッファ → レート整列 → ヘッドスイッチング
+マスク（§4.7）→ ラインジッタ補正 → フィールド処理 → プロックアンプ →
+ガード（信号断検出）→ 出力**。
 テレメトリは各段の通過時にカウンタを更新する。
 
 ### 4.1 フレーム同期・レート整列（`sync.rs`）
@@ -191,6 +192,19 @@ pub enum TbcError { FrameSizeMismatch{..}, InvalidConfig(String), SignalLost }
 周期は呼び出し側が決める。`tbc-cli` は1秒間隔で JSON Lines として stderr に出す
 （`tracing` + 構造化フィールド。フォーマットは §7 の `telemetry_interval_ms` で制御）。
 
+### 4.7 ヘッドスイッチングマスク（`head_switch.rs`）
+
+VHS 等でフレーム下部に現れるヘッドスイッチングノイズを、直上の正常ラインで
+隠蔽する段（Issue #29）。レート整列の直後・ジッタ補正の前に置き、ノイズが
+ライン別ジッタ推定を汚さないようにする。
+
+- 方式は2つ: `replicate`（マスク領域の全ラインを直上の正常ラインで置換）と
+  `interpolate`（各マスクラインを直上2つの出力ラインの平均で再帰生成）。
+- 設定は `head_switch_lines`（0 = 無効、既定）と `head_switch_mode`。
+  ライン数はフレーム高さ未満でなければならない。
+- 420 では色差平面の下部 ceil(N/2) ラインも同様に隠蔽する。10bit 形式は
+  境界変換後の 8bit フレームに対して適用される。
+
 ## 5. メモリ・パフォーマンス設計
 
 - **事前確保**: 起動時に `buffer_frames + 2` 枚分のフレームバッファをプールとして確保し、
@@ -227,7 +241,8 @@ CLI（`tbc-cli`、バイナリ名 `software-tbc`）:
 
 - 引数: `--input`（`-`=stdin）、`--output`（`-`=stdout）、`--width/--height/--format`、
   `--preset`、`--config`（TOML）、`--stamp nominal|wall-clock`、`--standard ntsc|pal|1080i`、
-  `--field-order progressive|top-first|bottom-first|auto`。
+  `--field-order progressive|top-first|bottom-first|auto`、
+  `--head-switch-lines N`、`--head-switch-mode replicate|interpolate`。
   優先順位: CLI引数 > 設定ファイル > プリセット > 既定値。
 - `--standard` は規格プリセット（Issue #25）: 幾何・目標レート・フィールド順序を一括指定する。
   ntsc = 720×480, 30000/1001, bottom-first / pal = 720×576, 25/1, top-first /
@@ -280,6 +295,8 @@ target_rate = "30000/1001"      # 有理数文字列
 rate_policy = "hold-drop"       # hold-drop | blend | motion-interpolate
 buffer_frames = 8
 jitter_correction = true
+head_switch_lines = 0           # 下部マスクのライン数（0 = 無効、§4.7）
+head_switch_mode = "replicate"  # replicate | interpolate
 signal_loss = "last-frame-hold" # last-frame-hold | blackout | test-pattern
 signal_loss_timeout_ms = 200
 telemetry_interval_ms = 1000
