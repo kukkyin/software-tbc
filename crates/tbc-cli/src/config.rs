@@ -57,6 +57,9 @@ pub struct CliConfig {
     /// Auto-adapt mode (Issue #32): range estimation and jitter
     /// search-range adaptation follow the source at runtime.
     pub auto_adapt: bool,
+    /// Analyze-only mode (Issue #37): run the pipeline, write
+    /// nothing, and print an analysis report instead.
+    pub analyze_only: bool,
     pub input: String,
     pub output: String,
     pub max_frames: Option<u64>,
@@ -83,6 +86,7 @@ impl Default for CliConfig {
             telemetry_format: TelemetryFormat::Json,
             overload_fallback: true,
             auto_adapt: false,
+            analyze_only: false,
             input: "-".to_string(),
             output: "-".to_string(),
             max_frames: None,
@@ -121,6 +125,7 @@ struct Overrides {
     telemetry_format: Option<TelemetryFormat>,
     overload_fallback: Option<bool>,
     auto_adapt: Option<bool>,
+    analyze_only: Option<bool>,
     procamp: ProcampOverrides,
 }
 
@@ -217,6 +222,9 @@ impl Overrides {
         }
         if let Some(v) = self.auto_adapt {
             cfg.auto_adapt = v;
+        }
+        if let Some(v) = self.analyze_only {
+            cfg.analyze_only = v;
         }
         let p = &mut core.procamp;
         if let Some(v) = self.procamp.luma_gain {
@@ -341,6 +349,7 @@ struct TomlConfig {
     telemetry_format: Option<String>,
     overload_fallback: Option<bool>,
     auto_adapt: Option<bool>,
+    analyze_only: Option<bool>,
     procamp: Option<TomlProcamp>,
 }
 
@@ -376,6 +385,7 @@ impl TomlConfig {
             max_shift_px: self.max_shift_px,
             overload_fallback: self.overload_fallback,
             auto_adapt: self.auto_adapt,
+            analyze_only: self.analyze_only,
             ..Default::default()
         };
         if let Some(s) = self.format {
@@ -624,6 +634,9 @@ pub fn resolve(args: &Args) -> Result<CliConfig, String> {
     if args.auto_adapt {
         cfg.auto_adapt = true;
     }
+    if args.analyze_only {
+        cfg.analyze_only = true;
+    }
 
     cfg.input = args.input.clone();
     cfg.output = args.output.clone();
@@ -762,6 +775,7 @@ mod tests {
             telemetry_format: None,
             no_overload_fallback: false,
             auto_adapt: false,
+            analyze_only: false,
             max_frames: None,
             fail_on_signal_loss: false,
         }
@@ -878,6 +892,23 @@ mod tests {
         assert!(!resolve(&a).expect("resolve").auto_adapt);
         a.auto_adapt = true;
         assert!(resolve(&a).expect("resolve").auto_adapt);
+    }
+
+    #[test]
+    fn analyze_only_resolves_from_toml_and_cli() {
+        let dir =
+            std::env::temp_dir().join(format!("software-tbc-cli-an37-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("tbc.toml");
+        std::fs::write(&path, "analyze_only = true\n").expect("write toml");
+        let cfg = resolve(&args(None, path.to_str())).expect("resolve");
+        assert!(cfg.analyze_only);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut a = args(None, None);
+        assert!(!resolve(&a).expect("resolve").analyze_only);
+        a.analyze_only = true;
+        assert!(resolve(&a).expect("resolve").analyze_only);
     }
 
     #[test]
