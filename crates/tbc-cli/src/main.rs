@@ -15,6 +15,7 @@ use std::io::{BufReader, BufWriter, Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+use tbc_core::adapt::{JitterAdapter, RangeClass, RangeEstimator};
 use tbc_core::field::FieldOrderDetector;
 use tbc_core::guard::SignalGuard;
 use tbc_core::head_switch::apply_head_switch;
@@ -108,6 +109,10 @@ pub struct Args {
     /// engages in wall-clock stamp mode).
     #[arg(long)]
     no_overload_fallback: bool,
+    /// Auto-adapt mode: estimate the luma range (limited/full) and
+    /// adapt the jitter search range to the source at runtime.
+    #[arg(long)]
+    auto_adapt: bool,
     /// Stop after emitting this many output frames.
     #[arg(long)]
     max_frames: Option<u64>,
@@ -355,6 +360,9 @@ struct Pipeline {
     /// detector publishes the effective order here, and `emit` tags
     /// every output frame with it. `None` outside auto mode.
     auto_order: Option<Arc<Mutex<FieldOrder>>>,
+    /// Auto-adapt estimators (Issue #32). `None` outside auto mode.
+    range_estimator: Option<RangeEstimator>,
+    jitter_adapter: Option<JitterAdapter>,
     applied_hold_drop: bool,
     frames_out: u64,
     last_emitted_seq: Option<u64>,
@@ -451,10 +459,40 @@ impl Pipeline {
                 // Conceal head-switching noise before jitter
                 // estimation sees the frame (Issue #29).
                 apply_head_switch(&mut out, &cfg.core.head_switch);
+                // Auto-adapt (Issue #32): the range estimator sees
+                // the synced frame before any level processing; a
+                // locked reclassification rebuilds the proc-amp.
+                if let Some(est) = self.range_estimator.as_mut() {
+                    if let Some(class) = est.observe(&out) {
+                        let mut pc = cfg.core.procamp;
+                        pc.full_range = class == RangeClass::Full;
+                        self.procamp = ProcAmp::new(pc);
+                        eprintln!(
+                            "software-tbc: auto-adapt: input range classified as {}",
+                            if class == RangeClass::Full {
+                                "full"
+                            } else {
+                                "limited"
+                            }
+                        );
+                    }
+                }
                 if !self.controller.skip_jitter() {
                     if let Some(det) = self.detector.as_mut() {
                         if let Some(shifts) = det.estimate(&out) {
                             let _ = apply_shifts(&mut out, &shifts);
+                            // Auto-adapt (Issue #32): follow the
+                            // observed jitter with the search range.
+                            let next = self
+                                .jitter_adapter
+                                .as_mut()
+                                .and_then(|ad| ad.observe(&shifts));
+                            if let Some(new_max) = next {
+                                det.set_max_shift_px(new_max);
+                                eprintln!(
+                                    "software-tbc: auto-adapt: jitter search range now +/-{new_max}px"
+                                );
+                            }
                         }
                     }
                 }
@@ -649,6 +687,9 @@ fn run(cfg: &config::CliConfig) -> i32 {
             ((core.target_rate.den as u128 * 1_000_000_000) / core.target_rate.num as u128) as u64,
         ),
         auto_order: cfg.field_order_auto.then(|| Arc::clone(&effective_order)),
+        range_estimator: cfg.auto_adapt.then(RangeEstimator::new),
+        jitter_adapter: (cfg.auto_adapt && core.jitter_correction)
+            .then(|| JitterAdapter::new(cfg.max_shift_px)),
         applied_hold_drop: false,
         frames_out: 0,
         last_emitted_seq: None,
