@@ -2,6 +2,8 @@
 
 A **software Time Base Corrector (TBC)** written in Rust.
 
+English | [日本語](README.ja.md)
+
 software-tbc sits in a raw-video pipe — typically between two FFmpeg
 processes — and turns the unstable output of analog / legacy video
 sources (VHS, S-VHS, composite game consoles, aging capture devices)
