@@ -53,6 +53,10 @@ pub struct Args {
     /// Named preset: vhs | svhs | unstable-composite | low-latency.
     #[arg(long)]
     preset: Option<String>,
+    /// Signal standard preset for geometry, rate and field order:
+    /// ntsc | pal | 1080i. Individual flags override it.
+    #[arg(long)]
+    standard: Option<String>,
     /// TOML configuration file (CLI flags override it).
     #[arg(long)]
     config: Option<String>,
