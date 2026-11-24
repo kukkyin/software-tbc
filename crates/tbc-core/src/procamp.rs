@@ -99,7 +99,14 @@ impl ProcAmp {
             return;
         }
         match frame.format {
-            PixelFormat::Yuv422p => self.apply_yuv422p(frame),
+            PixelFormat::Yuv422p | PixelFormat::Yuyv => self.apply_yuv422p(frame),
+            PixelFormat::Uyvy => {
+                // Same samples in U-Y-V-Y order: reorder into the 422
+                // layout, apply, and reorder back (Issue #23).
+                crate::swap_422_quads(&mut frame.data);
+                self.apply_yuv422p(frame);
+                crate::swap_422_quads(&mut frame.data);
+            }
             PixelFormat::Yuv420p => self.apply_yuv420p(frame),
             PixelFormat::Rgb24 => self.apply_rgb24(frame),
         }
