@@ -21,7 +21,7 @@ use tbc_core::procamp::ProcAmp;
 use tbc_core::sync::ring::RingBuffer;
 use tbc_core::sync::FrameSynchronizer;
 use tbc_core::telemetry::TelemetryCollector;
-use tbc_core::FrameRate;
+use tbc_core::{FrameRate, RatePolicy};
 use tbc_io::{
     FrameSink, FrameSource, IoError, RawGeometry, RawReader, RawWriter, SequenceSink,
     SequenceSource,
@@ -61,6 +61,10 @@ pub struct Args {
     /// always uses nominal.
     #[arg(long)]
     stamp: Option<String>,
+    /// Disable the overload fallback (staged degradation that only
+    /// engages in wall-clock stamp mode).
+    #[arg(long)]
+    no_overload_fallback: bool,
     /// Stop after emitting this many output frames.
     #[arg(long)]
     max_frames: Option<u64>,
@@ -132,6 +136,115 @@ impl Stamper {
     }
 }
 
+/// Frames of sustained overload before the stage rises (~1 s at 30 fps).
+const OVER_STREAK_FRAMES: u32 = 30;
+/// Frames of sustained headroom before the stage falls (~10 s).
+const UNDER_STREAK_FRAMES: u32 = 300;
+/// Minimum frames between stage changes (~5 s), against flapping.
+const MIN_DWELL_FRAMES: u32 = 150;
+
+/// Overload fallback controller (Issue #21). Watches the processing
+/// time per output frame (integer EMA, alpha 1/16) against the frame
+/// period and degrades the pipeline in stages when it cannot keep up:
+/// stage 1 skips jitter correction, stage 2 forces hold/drop over
+/// blend. Which stages exist depends on the configured levers (jitter
+/// on/off, blend on/off). Live-only by construction: the owner enables
+/// it solely in wall-clock stamp mode, because for file processing a
+/// slow machine must cost time, not quality. Hysteresis is asymmetric
+/// (fast attack, slow release) plus a minimum dwell per stage.
+struct OverloadController {
+    enabled: bool,
+    has_jitter: bool,
+    has_blend: bool,
+    period_ns: i64,
+    stage: u8,
+    events: u64,
+    ema_proc_ns: Option<i64>,
+    over_streak: u32,
+    under_streak: u32,
+    since_change: u32,
+}
+
+impl OverloadController {
+    fn new(enabled: bool, has_jitter: bool, has_blend: bool, period_ns: u64) -> Self {
+        OverloadController {
+            enabled,
+            has_jitter,
+            has_blend,
+            period_ns: period_ns as i64,
+            stage: 0,
+            events: 0,
+            ema_proc_ns: None,
+            over_streak: 0,
+            under_streak: 0,
+            since_change: MIN_DWELL_FRAMES,
+        }
+    }
+
+    fn max_stage(&self) -> u8 {
+        self.has_jitter as u8 + self.has_blend as u8
+    }
+
+    fn stage(&self) -> u8 {
+        self.stage
+    }
+
+    /// Cumulative count of stage rises.
+    fn events(&self) -> u64 {
+        self.events
+    }
+
+    fn skip_jitter(&self) -> bool {
+        self.has_jitter && self.stage >= 1
+    }
+
+    fn force_hold_drop(&self) -> bool {
+        if !self.has_blend {
+            return false;
+        }
+        // Blend is the second lever when jitter exists, else the first.
+        let needed = if self.has_jitter { 2 } else { 1 };
+        self.stage >= needed
+    }
+
+    /// Feed one output frame's processing time.
+    fn observe(&mut self, proc_ns: u64) {
+        if !self.enabled || self.max_stage() == 0 || self.period_ns <= 0 {
+            return;
+        }
+        let sample = proc_ns as i64;
+        let ema = match self.ema_proc_ns {
+            None => sample,
+            Some(e) => e + (sample - e) / 16,
+        };
+        self.ema_proc_ns = Some(ema);
+        self.since_change = self.since_change.saturating_add(1);
+        if ema > self.period_ns {
+            self.over_streak += 1;
+            self.under_streak = 0;
+        } else if ema * 2 < self.period_ns {
+            self.under_streak += 1;
+            self.over_streak = 0;
+        } else {
+            self.over_streak = 0;
+            self.under_streak = 0;
+        }
+        if self.since_change < MIN_DWELL_FRAMES {
+            return;
+        }
+        if self.over_streak >= OVER_STREAK_FRAMES && self.stage < self.max_stage() {
+            self.stage += 1;
+            self.events += 1;
+            self.over_streak = 0;
+            self.since_change = 0;
+        } else if self.under_streak >= UNDER_STREAK_FRAMES && self.stage > 0 {
+            self.stage -= 1;
+            self.under_streak = 0;
+            self.since_change = 0;
+        }
+    }
+}
+
 fn open_source(cfg: &config::CliConfig) -> Result<Box<dyn FrameSource + Send>, IoError> {
     let geometry = RawGeometry {
         width: cfg.core.width,
@@ -168,6 +281,8 @@ struct Pipeline {
     detector: Option<JitterDetector>,
     guard: SignalGuard,
     collector: TelemetryCollector,
+    controller: OverloadController,
+    applied_hold_drop: bool,
     frames_out: u64,
     last_emitted_seq: Option<u64>,
     last_output_pts: u64,
@@ -219,9 +334,11 @@ impl Pipeline {
         }
         match self.sync.next_output() {
             Some(mut out) => {
-                if let Some(det) = self.detector.as_mut() {
-                    if let Some(shifts) = det.estimate(&out) {
-                        let _ = apply_shifts(&mut out, &shifts);
+                if !self.controller.skip_jitter() {
+                    if let Some(det) = self.detector.as_mut() {
+                        if let Some(shifts) = det.estimate(&out) {
+                            let _ = apply_shifts(&mut out, &shifts);
+                        }
                     }
                 }
                 self.procamp.apply(&mut out);
@@ -236,14 +353,16 @@ impl Pipeline {
         let latency_ms =
             self.last_input_pts.saturating_sub(self.last_output_pts) as f64 / 1_000_000.0;
         eprintln!(
-            "{{\"latency_ms\":{:.3},\"buffer_fill_ratio\":{:.3},\"dropped_frames\":{},\"duplicated_frames\":{},\"jitter_ms\":{:.3},\"frames_in\":{},\"frames_out\":{}}}",
+            "{{\"latency_ms\":{:.3},\"buffer_fill_ratio\":{:.3},\"dropped_frames\":{},\"duplicated_frames\":{},\"jitter_ms\":{:.3},\"frames_in\":{},\"frames_out\":{},\"degraded_stage\":{},\"degrade_events\":{}}}",
             latency_ms,
             ring.fill_ratio(),
             self.sync.dropped_frames(),
             self.sync.duplicated_frames(),
             t.jitter_ms,
             t.frames_in,
-            self.frames_out
+            self.frames_out,
+            self.controller.stage(),
+            self.controller.events()
         );
     }
 }
@@ -339,6 +458,13 @@ fn run(cfg: &config::CliConfig) -> i32 {
         },
         guard: SignalGuard::new(core.signal_loss, cfg.signal_loss_timeout_ms),
         collector: TelemetryCollector::new(),
+        controller: OverloadController::new(
+            cfg.overload_fallback && stamp_mode == config::StampMode::WallClock,
+            core.jitter_correction,
+            core.rate_policy == RatePolicy::Blend,
+            ((core.target_rate.den as u128 * 1_000_000_000) / core.target_rate.num as u128) as u64,
+        ),
+        applied_hold_drop: false,
         frames_out: 0,
         last_emitted_seq: None,
         last_output_pts: 0,
@@ -373,7 +499,19 @@ fn run(cfg: &config::CliConfig) -> i32 {
                 pipe.prev_dropped = dropped;
                 pipe.prev_duplicated = duplicated;
 
-                if !pipe.process_output(cfg, &mut sink) {
+                let started = Instant::now();
+                let keep_going = pipe.process_output(cfg, &mut sink);
+                pipe.controller.observe(started.elapsed().as_nanos() as u64);
+                let want_hold_drop = pipe.controller.force_hold_drop();
+                if want_hold_drop != pipe.applied_hold_drop {
+                    pipe.sync.set_rate_policy(if want_hold_drop {
+                        RatePolicy::HoldDrop
+                    } else {
+                        core.rate_policy
+                    });
+                    pipe.applied_hold_drop = want_hold_drop;
+                }
+                if !keep_going {
                     stopped = true;
                     break 'main;
                 }
@@ -476,5 +614,83 @@ mod tests {
         );
         // An out-of-order instant saturates at zero instead of wrapping.
         assert_eq!(stamper.stamp(t0), 0);
+    }
+
+    const PERIOD: u64 = 33_366_666; // 30000/1001
+
+    fn feed(controller: &mut OverloadController, proc_ns: u64, frames: u32) {
+        for _ in 0..frames {
+            controller.observe(proc_ns);
+        }
+    }
+
+    #[test]
+    fn controller_escalates_and_recovers_in_stages() {
+        let mut c = OverloadController::new(true, true, true, PERIOD);
+        // Sustained 2x overload: stage 1 after the attack streak.
+        feed(&mut c, 2 * PERIOD, 30);
+        assert_eq!(c.stage(), 1);
+        assert!(c.skip_jitter());
+        assert!(!c.force_hold_drop());
+        // Still overloaded past the dwell: stage 2.
+        feed(&mut c, 2 * PERIOD, 200);
+        assert_eq!(c.stage(), 2);
+        assert!(c.force_hold_drop());
+        assert_eq!(c.events(), 2);
+        // Sustained headroom releases one stage at a time.
+        feed(&mut c, PERIOD / 3, 500);
+        assert_eq!(c.stage(), 1);
+        feed(&mut c, PERIOD / 3, 500);
+        assert_eq!(c.stage(), 0);
+        assert!(!c.skip_jitter());
+    }
+
+    #[test]
+    fn controller_ignores_a_single_spike() {
+        let mut c = OverloadController::new(true, true, true, PERIOD);
+        feed(&mut c, PERIOD / 5, 100);
+        c.observe(10 * PERIOD); // one transient spike
+        feed(&mut c, PERIOD / 5, 100);
+        assert_eq!(c.stage(), 0);
+        assert_eq!(c.events(), 0);
+    }
+
+    #[test]
+    fn controller_does_not_flap_around_the_threshold() {
+        let mut c = OverloadController::new(true, true, true, PERIOD);
+        // Alternating short blocks never build a full streak.
+        for _ in 0..10 {
+            feed(&mut c, PERIOD * 6 / 5, 20);
+            feed(&mut c, PERIOD * 2 / 5, 20);
+        }
+        assert_eq!(c.stage(), 0);
+        assert_eq!(c.events(), 0);
+    }
+
+    #[test]
+    fn controller_caps_at_the_available_levers() {
+        // Blend only: stage 1 already forces hold/drop, and is the cap.
+        let mut c = OverloadController::new(true, false, true, PERIOD);
+        feed(&mut c, 2 * PERIOD, 400);
+        assert_eq!(c.stage(), 1);
+        assert!(c.force_hold_drop());
+        assert!(!c.skip_jitter());
+        // Jitter only: stage 1 skips jitter, and is the cap.
+        let mut c = OverloadController::new(true, true, false, PERIOD);
+        feed(&mut c, 2 * PERIOD, 400);
+        assert_eq!(c.stage(), 1);
+        assert!(c.skip_jitter());
+        assert!(!c.force_hold_drop());
+    }
+
+    #[test]
+    fn controller_inert_when_disabled_or_leverless() {
+        let mut c = OverloadController::new(false, true, true, PERIOD);
+        feed(&mut c, 2 * PERIOD, 500);
+        assert_eq!(c.stage(), 0);
+        let mut c = OverloadController::new(true, false, false, PERIOD);
+        feed(&mut c, 2 * PERIOD, 500);
+        assert_eq!(c.stage(), 0);
+        assert_eq!(c.events(), 0);
     }
 }
