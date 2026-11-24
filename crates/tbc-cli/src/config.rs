@@ -91,6 +91,7 @@ struct ProcampOverrides {
     saturation: Option<f32>,
     hue_degrees: Option<f32>,
     gamma: Option<f32>,
+    chroma_shift_px: Option<f32>,
 }
 
 impl Overrides {
@@ -162,6 +163,9 @@ impl Overrides {
         }
         if let Some(v) = self.procamp.gamma {
             p.gamma = v;
+        }
+        if let Some(v) = self.procamp.chroma_shift_px {
+            p.chroma_shift_px = v;
         }
     }
 }
@@ -268,6 +272,7 @@ struct TomlProcamp {
     saturation: Option<f32>,
     hue_degrees: Option<f32>,
     gamma: Option<f32>,
+    chroma_shift_px: Option<f32>,
 }
 
 impl TomlConfig {
@@ -312,6 +317,7 @@ impl TomlConfig {
                 saturation: p.saturation,
                 hue_degrees: p.hue_degrees,
                 gamma: p.gamma,
+                chroma_shift_px: p.chroma_shift_px,
             };
         }
         Ok(o)
@@ -528,6 +534,19 @@ mod tests {
     #[test]
     fn unknown_preset_is_an_error() {
         assert!(resolve(&args(Some("betamax"), None)).is_err());
+    }
+
+    #[test]
+    fn toml_procamp_chroma_shift_resolves() {
+        let dir = std::env::temp_dir().join(format!("software-tbc-cli-cs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("tbc.toml");
+        std::fs::write(&path, "[procamp]\nchroma_shift_px = 1.5\n").expect("write toml");
+        let cfg = resolve(&args(None, path.to_str())).expect("resolve");
+        assert_eq!(cfg.core.procamp.chroma_shift_px, 1.5);
+        // Untouched controls stay neutral.
+        assert_eq!(cfg.core.procamp.saturation, 1.0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
