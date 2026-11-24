@@ -127,6 +127,16 @@ pub fn black_frame(width: u32, height: u32, format: PixelFormat) -> VideoFrame {
                 quad[3] = 16;
             }
         }
+        PixelFormat::Yuv420p10 | PixelFormat::Yuv422p10 => {
+            // Planar u16 samples: luma at 64 (the 10-bit scaling of
+            // 16), chroma neutral at 512. The Y plane comes first
+            // and holds width*height samples in both layouts.
+            let px = (width * height) as usize;
+            for (i, chunk) in frame.data.chunks_exact_mut(2).enumerate() {
+                let v: u16 = if i < px { 64 } else { 512 };
+                chunk.copy_from_slice(&v.to_le_bytes());
+            }
+        }
         PixelFormat::Yuv420p => {
             let y_size = (width * height) as usize;
             for b in &mut frame.data[..y_size] {
@@ -198,6 +208,17 @@ pub fn test_pattern(width: u32, height: u32, format: PixelFormat) -> VideoFrame 
                         frame.data[o] = cr;
                     }
                 }
+            }
+        }
+        PixelFormat::Yuv420p10 | PixelFormat::Yuv422p10 => {
+            // Generate the 8-bit pattern and expand it (Issue #27).
+            let eq = if format == PixelFormat::Yuv420p10 {
+                PixelFormat::Yuv420p
+            } else {
+                PixelFormat::Yuv422p
+            };
+            if let Ok(expanded) = VideoFrame::from_8bit(&test_pattern(width, height, eq), format) {
+                return expanded;
             }
         }
         PixelFormat::Yuv420p => {
