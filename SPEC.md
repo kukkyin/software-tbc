@@ -27,7 +27,8 @@
 
 - 扱う信号は RAW フレーム列（ヘッダなし）。解像度・ピクセルフォーマット・フレームレートは外部から与えられる。
 - 対応フォーマットは `yuv420p` / `yuv422p` / `rgb24`（8bit）に加え、パックド 4:2:2 の
-  `uyvy` / `yuyv` を境界変換で対応する（Issue #23、§3）。10bit は将来拡張（§10）。
+  `uyvy` / `yuyv` を境界変換で対応する（Issue #23、§3）。10bit の `yuv420p10le` /
+  `yuv422p10le` も境界変換で対応する（Issue #27、§3）。
 - インターレースは 480i/576i を主対象とし、フィールドオーダーを保持したまま処理する。
 
 ## 2. ワークスペース構成
@@ -61,7 +62,7 @@ software-tbc/
 正の定義は `crates/tbc-core/src/lib.rs`。要点:
 
 ```rust
-pub enum PixelFormat { Yuv420p, Yuv422p, Rgb24, Uyvy, Yuyv }  // frame_size(w,h) を提供
+pub enum PixelFormat { Yuv420p, Yuv422p, Rgb24, Uyvy, Yuyv, Yuv420p10, Yuv422p10 }  // frame_size(w,h) を提供
 pub struct FrameRate { pub num: u32, pub den: u32 }     // 有理数。29.97 = 30000/1001
 pub enum FieldOrder { Progressive, TopFieldFirst, BottomFieldFirst }
 pub struct VideoFrame {
@@ -79,6 +80,15 @@ pub enum TbcError { FrameSizeMismatch{..}, InvalidConfig(String), SignalLost }
 バイト順であり、平面配置ではない。`Uyvy` / `Yuyv` は入出力境界でのみ現れる形式で、
 `VideoFrame::to_yuv422p` / `from_yuv422p` により内部表現と可逆変換する
 （4:2:2 同士のためバイト並べ替えのみでビット完全）。パックド形式は偶数幅必須。
+
+注記（Issue #27）: `Yuv420p10` / `Yuv422p10` はプレーナ配置・u16 リトルエンディアン・
+下位10ビットに値を持つ境界形式（FFmpeg の `yuv420p10le` / `yuv422p10le`）で、
+`VideoFrame::to_8bit` / `from_8bit` により 8bit の内部表現と変換する。内部処理は
+8bit のままである点に注意（ネイティブ 16bit 処理は将来拡張、§10）。スケーリングは
+10→8 が `(v * 255 + 511) / 1023`、8→10 が `(v * 1023 + 127) / 255`（端点が正確に
+対応する最近傍丸め）で、8→10→8 の往復は無損失、10→8→10 の往復誤差は数 LSB 以内。
+上位ビットに値を格納する変種（p010 等）は対象外。幾何制約は 8bit 版と同じ
+（420 系は偶数幅・偶数高さ、422 系は偶数幅）。
 
 エラー方針:
 
@@ -264,7 +274,7 @@ TOML 形式。`TbcConfig`（§3）＋CLI節をシリアライズしたもの。
 ```toml
 width = 720
 height = 480
-format = "yuv422p"              # yuv420p | yuv422p | rgb24 | uyvy | yuyv
+format = "yuv422p"              # yuv420p | yuv422p | rgb24 | uyvy | yuyv | yuv420p10le | yuv422p10le
 field_order = "bottom-first"    # progressive | top-first | bottom-first | auto（自動判定、§4.3）
 target_rate = "30000/1001"      # 有理数文字列
 rate_policy = "hold-drop"       # hold-drop | blend | motion-interpolate
@@ -322,7 +332,8 @@ gamma = 1.0
 
 ## 10. 範囲外・将来拡張
 
-- 10bit / HDR、BT.709/2020
+- HDR、BT.709/2020（10bit は境界変換で対応済み。内部処理まで 16bit 化する
+  ネイティブ対応は将来拡張）
 - 高品質デインターレース（Yadif相当）、モーション補間（光フロー）
 - 音声の同期・リサンプル（映像のみ扱う。音声は FFmpeg 側で遅延調整する前提）
 - GUI プレビュー（トレイト経由の別クレートで対応可能な設計にはする）
