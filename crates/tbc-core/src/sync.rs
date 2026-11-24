@@ -6,6 +6,97 @@
 use crate::{RatePolicy, TbcConfig, VideoFrame};
 use std::collections::VecDeque;
 
+/// Stability gate for drift re-anchoring (Issue #35).
+///
+/// Re-anchoring starts only after the drift estimate has stayed
+/// beyond the start threshold, with a consistent sign, for
+/// `REQUIRED_FRAMES` consecutive output frames, so a transient EMA
+/// excursion (arrival jitter, a stall, a single bad interval) never
+/// moves the schedule. Once active, the gate stays open down to the
+/// lower stop threshold (hysteresis) and closes immediately on a
+/// sign flip. Estimates beyond the hard limit are not drift at all
+/// (a genuinely different input rate) and reset the gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelockState {
+    Inactive,
+    Qualifying { sign: i64, frames: u32 },
+    Active { sign: i64 },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RelockGate {
+    state: RelockState,
+}
+
+impl RelockGate {
+    /// Drift magnitude that starts qualification, ppm.
+    const START_PPM: i64 = 500;
+    /// Drift magnitude that ends an active re-lock, ppm.
+    const STOP_PPM: i64 = 350;
+    /// Hard limit, ppm: beyond this the gate resets and never opens.
+    const MAX_PPM: i64 = 10_000;
+    /// Consecutive in-band output frames required to open the gate.
+    const REQUIRED_FRAMES: u32 = 30;
+
+    fn new() -> Self {
+        RelockGate {
+            state: RelockState::Inactive,
+        }
+    }
+
+    fn is_active(&self) -> bool {
+        matches!(self.state, RelockState::Active { .. })
+    }
+
+    /// Close the gate unconditionally (input discontinuity, Issue #35).
+    fn reset(&mut self) {
+        self.state = RelockState::Inactive;
+    }
+
+    /// Feed the current drift estimate (once per output frame);
+    /// returns whether re-anchoring is allowed for this frame.
+    fn update(&mut self, drift_ppm: i64) -> bool {
+        let magnitude = drift_ppm.saturating_abs();
+        if magnitude > Self::MAX_PPM {
+            self.state = RelockState::Inactive;
+            return false;
+        }
+        let sign = drift_ppm.signum();
+        match self.state {
+            RelockState::Inactive => {
+                if magnitude > Self::START_PPM {
+                    self.state = RelockState::Qualifying { sign, frames: 1 };
+                }
+                false
+            }
+            RelockState::Qualifying {
+                sign: prev_sign,
+                frames,
+            } => {
+                if sign != prev_sign || magnitude <= Self::START_PPM {
+                    self.state = RelockState::Inactive;
+                    return false;
+                }
+                let next = frames.saturating_add(1);
+                if next >= Self::REQUIRED_FRAMES {
+                    self.state = RelockState::Active { sign };
+                    true
+                } else {
+                    self.state = RelockState::Qualifying { sign, frames: next };
+                    false
+                }
+            }
+            RelockState::Active { sign: prev_sign } => {
+                if sign != prev_sign || magnitude <= Self::STOP_PPM {
+                    self.state = RelockState::Inactive;
+                    return false;
+                }
+                true
+            }
+        }
+    }
+}
+
 /// Stateful synchroniser: ingest frames on the input clock, release them
 /// on the target-rate output clock according to the configured policy.
 ///
@@ -31,7 +122,13 @@ pub struct FrameSynchronizer {
     // Drift estimation: integer EMA of inter-arrival intervals.
     last_ingest_pts: Option<u64>,
     ema_interval_ns: Option<i64>,
+    /// Remainder carried across EMA updates (Issue #35): without it,
+    /// errors smaller than the 1/256 step are truncated away forever
+    /// and the estimate keeps a systematic bias over long runs.
+    ema_remainder_ns: i64,
     drift_ppm: i64,
+    /// Stability gate deciding when re-anchoring may run (Issue #35).
+    relock: RelockGate,
 }
 
 impl FrameSynchronizer {
@@ -49,7 +146,9 @@ impl FrameSynchronizer {
             duplicated: 0,
             last_ingest_pts: None,
             ema_interval_ns: None,
+            ema_remainder_ns: 0,
             drift_ppm: 0,
+            relock: RelockGate::new(),
         }
     }
 
@@ -100,29 +199,58 @@ impl FrameSynchronizer {
         }
         if let Some(last) = self.last_ingest_pts {
             let interval = frame.pts_ns.saturating_sub(last) as i64;
-            let ema = match self.ema_interval_ns {
-                None => interval,
-                Some(e) => e + (interval - e) / 256,
-            };
-            self.ema_interval_ns = Some(ema);
             let nominal = self.nominal_interval_ns();
-            if nominal > 0 {
-                self.drift_ppm = ((ema - nominal) * 1_000_000) / nominal;
+            // Outlier rejection (Issue #35): an interval far outside
+            // the plausible drift band is a gap or discontinuity
+            // (signal loss, a stall, a seek), not clock drift. Feeding
+            // it to the EMA would spike the estimate and, on recovery,
+            // drag the schedule with it; the frame itself is still
+            // queued normally.
+            let plausible =
+                nominal > 0 && interval >= nominal / 4 && interval <= nominal.saturating_mul(4);
+            if plausible {
+                // The EMA seeds at the nominal interval, not at the
+                // first observed one (Issue #35): a single noisy first
+                // interval would otherwise read as several thousand
+                // ppm of phantom drift and decay through the gate's
+                // band for hundreds of frames.
+                let start = self.ema_interval_ns.unwrap_or(nominal);
+                // Carry the division remainder across updates so
+                // sub-step errors are not truncated away (Issue #35).
+                let numerator = (interval - start) + self.ema_remainder_ns;
+                self.ema_remainder_ns = numerator % 256;
+                let ema = start + numerator / 256;
+                self.ema_interval_ns = Some(ema);
+                self.drift_ppm = (((ema - nominal) as i128 * 1_000_000) / nominal as i128) as i64;
+            } else if nominal > 0 {
+                // A rejected interval marks a discontinuity: any gate
+                // qualification was earned under pre-gap conditions,
+                // so the gate closes and must re-qualify on the
+                // post-gap stream (Issue #35).
+                self.relock.reset();
             }
         }
         self.last_ingest_pts = Some(frame.pts_ns);
         self.queue.push_back(frame);
     }
 
-    /// Gradual re-anchor: when the estimated drift exceeds ±500 ppm,
-    /// shift the schedule by the per-frame error, capped at 1/8 of a
-    /// frame interval per output frame (SPEC.md §4.1).
+    /// Whether the drift re-lock gate is currently open (Issue #35;
+    /// exposed for telemetry and tests).
+    pub fn relock_active(&self) -> bool {
+        self.relock.is_active()
+    }
+
+    /// Gradual re-anchor: while the stability gate is open (the
+    /// estimated drift has stayed in the ±500..10 000 ppm band, one
+    /// sign, for 30 consecutive output frames), shift the schedule by
+    /// the per-frame error, capped at 1/8 of a frame interval per
+    /// output frame (SPEC.md §4.1, Issue #35).
     ///
     /// Estimates beyond ±10 000 ppm (1%) are not clock drift at all but
-    /// a genuinely different input rate (rate conversion); the schedule
-    /// must not chase those.
+    /// a genuinely different input rate (rate conversion); the gate
+    /// keeps the schedule from chasing those.
     fn reanchor(&mut self) {
-        if self.drift_ppm.abs() <= 500 || self.drift_ppm.abs() > 10_000 {
+        if !self.relock.update(self.drift_ppm) {
             return;
         }
         let Some(ema) = self.ema_interval_ns else {
@@ -295,6 +423,248 @@ mod tests {
         }
         let ppm = sync.drift_ppm_estimate();
         assert!((800..=1200).contains(&ppm), "drift estimate was {ppm} ppm");
+    }
+
+    #[test]
+    fn relock_gate_opens_only_after_thirty_sustained_frames() {
+        let mut gate = RelockGate::new();
+        for _ in 0..29 {
+            assert!(!gate.update(2_000));
+        }
+        assert!(gate.update(2_000));
+        assert!(gate.is_active());
+    }
+
+    #[test]
+    fn relock_gate_resets_on_return_sign_flip_and_hard_limit() {
+        // Returning inside the start band resets qualification.
+        let mut gate = RelockGate::new();
+        for _ in 0..10 {
+            gate.update(2_000);
+        }
+        assert!(!gate.update(100));
+        for _ in 0..29 {
+            assert!(!gate.update(2_000));
+        }
+        assert!(gate.update(2_000));
+        // A sign flip closes an active gate immediately.
+        assert!(!gate.update(-2_000));
+        assert!(!gate.is_active());
+        // The hard limit: exactly 10 000 ppm qualifies, beyond resets.
+        let mut gate = RelockGate::new();
+        for _ in 0..29 {
+            assert!(!gate.update(10_000));
+        }
+        assert!(gate.update(10_000));
+        assert!(!gate.update(10_001));
+        assert!(!gate.is_active());
+    }
+
+    #[test]
+    fn relock_gate_hysteresis_holds_until_stop_threshold() {
+        let mut gate = RelockGate::new();
+        for _ in 0..30 {
+            gate.update(2_000);
+        }
+        assert!(gate.is_active());
+        // Between the stop and start thresholds the gate stays open.
+        assert!(gate.update(400));
+        assert!(gate.update(351));
+        // At the stop threshold it closes.
+        assert!(!gate.update(350));
+        assert!(!gate.is_active());
+    }
+
+    #[test]
+    fn relock_gate_never_opens_when_drift_hovers_at_the_threshold() {
+        // Alternating across the start threshold keeps resetting the
+        // qualification counter.
+        let mut gate = RelockGate::new();
+        for _ in 0..100 {
+            for _ in 0..10 {
+                assert!(!gate.update(600));
+            }
+            assert!(!gate.update(400));
+        }
+        assert!(!gate.is_active());
+    }
+
+    #[test]
+    fn duplicate_pts_frames_do_not_pollute_the_estimate() {
+        // Repeated timestamps (interval 0) are discontinuities, not
+        // drift: the estimate and the anchor must not move.
+        let mut sync = FrameSynchronizer::new(config(RatePolicy::HoldDrop));
+        for i in 0..300u64 {
+            sync.ingest(frame(i, i * DUR));
+            let _ = sync.next_output();
+        }
+        for i in 300..400u64 {
+            sync.ingest(frame(i, 299 * DUR)); // same pts, repeatedly
+            let _ = sync.next_output();
+        }
+        assert_eq!(sync.anchor_adjust_ns, 0);
+        assert!(sync.drift_ppm_estimate().abs() < 50);
+    }
+
+    #[test]
+    fn ema_remainder_carry_converges_below_the_old_dead_zone() {
+        // Intervals 100 ns longer than nominal (~3 ppm): the old
+        // truncating EMA never moved at all (100 / 256 == 0 per step).
+        let mut sync = FrameSynchronizer::new(config(RatePolicy::HoldDrop));
+        for i in 0..5_000u64 {
+            sync.ingest(frame(i, i * (DUR + 100)));
+            let _ = sync.next_output();
+        }
+        let ema = sync.ema_interval_ns.expect("ema exists");
+        assert!(
+            (DUR as i64 + 98..=DUR as i64 + 100).contains(&ema),
+            "ema was {ema}"
+        );
+        assert!((1..=6).contains(&sync.drift_ppm_estimate()));
+    }
+
+    /// Deterministic test RNG (seeded, per the repo rules).
+    struct XorShift(u64);
+
+    impl XorShift {
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        /// Uniform value in [-span, span].
+        fn jitter(&mut self, span: i64) -> i64 {
+            (self.next_u64() % (2 * span as u64 + 1)) as i64 - span
+        }
+    }
+
+    #[test]
+    fn long_run_drift_tracking_stays_bounded() {
+        // +2000 ppm with ±0.5% arrival jitter, 100k frames (~56 min
+        // at 29.97 fps, accelerated): the gate must lock, the
+        // cumulative shift must track the theoretical drift integral,
+        // and the queue must not diverge.
+        let mut sync = FrameSynchronizer::new(config(RatePolicy::HoldDrop));
+        let mut rng = XorShift(0x9E37_79B9_7F4A_7C15);
+        let base = DUR as i64 + DUR as i64 / 500; // +2000 ppm
+        let span = DUR as i64 / 200; // ±0.5%
+        let mut pts: u64 = 0;
+        let mut last_out_pts: Option<u64> = None;
+        let mut outputs = 0u64;
+        for i in 0..100_000u64 {
+            let interval = base + rng.jitter(span);
+            pts = pts.saturating_add(interval.max(1) as u64);
+            sync.ingest(frame(i, pts));
+            if let Some(out) = sync.next_output() {
+                if let Some(prev) = last_out_pts {
+                    assert!(out.pts_ns >= prev, "output pts went backwards");
+                }
+                last_out_pts = Some(out.pts_ns);
+                outputs += 1;
+            }
+        }
+        assert!(sync.relock_active(), "gate never locked");
+        assert!(outputs > 99_000, "outputs were {outputs}");
+        // Theoretical cumulative shift: 100k outputs x 2000 ppm of DUR.
+        let theory = 100_000i128 * DUR as i128 / 500;
+        let adjust = sync.anchor_adjust_ns as i128;
+        assert!(
+            adjust * 100 >= theory * 80 && adjust * 100 <= theory * 120,
+            "anchor adjust {adjust} vs theory {theory}"
+        );
+        assert!(
+            sync.queue.len() < 100,
+            "queue diverged: {}",
+            sync.queue.len()
+        );
+        assert!(
+            sync.duplicated_frames() < 1_000,
+            "duplicated {}",
+            sync.duplicated_frames()
+        );
+        assert!(
+            sync.dropped_frames() < 10,
+            "dropped {}",
+            sync.dropped_frames()
+        );
+    }
+
+    #[test]
+    fn jitter_only_never_opens_the_gate() {
+        // 0 ppm drift with ±0.5% arrival jitter: no re-anchoring at
+        // all may happen (the false-positive case the gate exists for).
+        let mut sync = FrameSynchronizer::new(config(RatePolicy::HoldDrop));
+        let mut rng = XorShift(0x1234_5678_9ABC_DEF0);
+        let span = DUR as i64 / 200;
+        let mut pts: u64 = 0;
+        for i in 0..20_000u64 {
+            let interval = DUR as i64 + rng.jitter(span);
+            pts = pts.saturating_add(interval.max(1) as u64);
+            sync.ingest(frame(i, pts));
+            let _ = sync.next_output();
+            assert_eq!(sync.anchor_adjust_ns, 0, "anchor moved at frame {i}");
+        }
+        assert!(!sync.relock_active());
+    }
+
+    #[test]
+    fn sign_flip_relocks_in_the_new_direction_without_runaway() {
+        let mut sync = FrameSynchronizer::new(config(RatePolicy::HoldDrop));
+        let fast = DUR + DUR / 500;
+        let slow = DUR - DUR / 500;
+        let mut pts: u64 = 0;
+        for i in 0..20_000u64 {
+            pts += fast;
+            sync.ingest(frame(i, pts));
+            let _ = sync.next_output();
+        }
+        let adjust_up = sync.anchor_adjust_ns;
+        assert!(adjust_up > 1_000_000_000, "phase 1 adjust {adjust_up}");
+        for i in 20_000..40_000u64 {
+            pts += slow;
+            sync.ingest(frame(i, pts));
+            let _ = sync.next_output();
+        }
+        // The accumulated shift unwinds towards the new direction and
+        // the gate is locked again, negatively.
+        assert!(
+            sync.anchor_adjust_ns < adjust_up / 2,
+            "adjust did not unwind: {} (was {adjust_up})",
+            sync.anchor_adjust_ns
+        );
+        assert!(sync.anchor_adjust_ns > -adjust_up, "adjust ran away");
+        assert!(sync.relock_active());
+        assert!(sync.drift_ppm_estimate() < -1_500);
+    }
+
+    #[test]
+    fn ingest_gap_does_not_pollute_the_drift_estimate() {
+        // A 1 s hole in the input (signal loss / stall) is a
+        // discontinuity, not drift: the EMA must ignore the gap
+        // interval and the anchor must not jump on recovery.
+        let mut sync = FrameSynchronizer::new(config(RatePolicy::HoldDrop));
+        let mut pts: u64 = 0;
+        for i in 0..2_000u64 {
+            pts += DUR;
+            sync.ingest(frame(i, pts));
+            let _ = sync.next_output();
+        }
+        assert_eq!(sync.anchor_adjust_ns, 0);
+        pts += 1_000_000_000; // the gap
+        for i in 2_000..4_000u64 {
+            pts += DUR;
+            sync.ingest(frame(i, pts));
+            let _ = sync.next_output();
+        }
+        assert_eq!(sync.anchor_adjust_ns, 0, "anchor jumped after a gap");
+        assert!(
+            sync.drift_ppm_estimate().abs() < 50,
+            "drift after gap was {}",
+            sync.drift_ppm_estimate()
+        );
     }
 
     #[test]
