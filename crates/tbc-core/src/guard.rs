@@ -78,8 +78,10 @@ impl SignalGuard {
     }
 
     /// The frame to emit while the signal is lost, per policy.
-    /// `None` only when the policy is LastFrameHold and no good frame
-    /// has ever been seen.
+    /// `None` when the policy is LastFrameHold and no good frame has
+    /// ever been seen, and always for Passthrough, which substitutes
+    /// no frame: the pipeline emits the real input frame instead
+    /// (Issue #34).
     pub fn fallback_frame(
         &self,
         width: u32,
@@ -90,6 +92,7 @@ impl SignalGuard {
             SignalLossPolicy::LastFrameHold => self.last_good.clone()?,
             SignalLossPolicy::Blackout => black_frame(width, height, format),
             SignalLossPolicy::TestPattern => test_pattern(width, height, format),
+            SignalLossPolicy::Passthrough => return None,
         };
         Some(frame)
     }
@@ -325,6 +328,25 @@ mod tests {
             .fallback_frame(4, 2, PixelFormat::Yuv422p)
             .expect("fallback");
         assert_eq!(frame.sequence, 1);
+    }
+
+    #[test]
+    fn passthrough_substitutes_no_frame_but_still_tracks_state() {
+        let mut guard = SignalGuard::new(SignalLossPolicy::Passthrough, 200);
+        guard.note_good_frame(&good_frame());
+        // Even with a good frame on record, passthrough has no
+        // fallback: the pipeline passes the real frame through.
+        assert!(guard.fallback_frame(4, 2, PixelFormat::Yuv422p).is_none());
+        // Loss and recovery transitions are unchanged.
+        assert_eq!(guard.note_bad_frame(), None);
+        assert_eq!(guard.note_bad_frame(), None);
+        assert_eq!(guard.note_bad_frame(), Some(GuardEvent::SignalLost));
+        assert!(guard.fallback_frame(4, 2, PixelFormat::Yuv422p).is_none());
+        assert_eq!(guard.note_good_frame(&good_frame()), None);
+        assert_eq!(
+            guard.note_good_frame(&good_frame()),
+            Some(GuardEvent::SignalRecovered)
+        );
     }
 
     #[test]
