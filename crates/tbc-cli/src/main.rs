@@ -14,10 +14,10 @@ use clap::Parser;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tbc_core::adapt::{JitterAdapter, RangeClass, RangeEstimator};
 use tbc_core::field::FieldOrderDetector;
-use tbc_core::guard::SignalGuard;
+use tbc_core::guard::{GuardEvent, SignalGuard};
 use tbc_core::head_switch::apply_head_switch;
 use tbc_core::jitter::{apply_shifts, JitterDetector};
 use tbc_core::procamp::ProcAmp;
@@ -112,6 +112,9 @@ pub struct Args {
     /// unprocessed instead of substituting a fallback frame).
     #[arg(long)]
     signal_loss: Option<String>,
+    /// Telemetry format: json (JSON Lines) or csv (fixed columns).
+    #[arg(long)]
+    telemetry_format: Option<String>,
     /// Disable the overload fallback (staged degradation that only
     /// engages in wall-clock stamp mode).
     #[arg(long)]
@@ -381,6 +384,11 @@ struct Pipeline {
     prev_dropped: u64,
     prev_duplicated: u64,
     output_error: bool,
+    /// Signal-loss bookkeeping for telemetry (Issue #36): episode
+    /// count, the current episode's start, and total lost time.
+    signal_loss_events: u64,
+    lost_since: Option<Instant>,
+    signal_lost_ms_total: u64,
 }
 
 impl Pipeline {
@@ -526,23 +534,300 @@ impl Pipeline {
         }
     }
 
-    fn report_telemetry(&self, ring: &RingBuffer) {
+    fn report_telemetry(&mut self, cfg: &config::CliConfig, ring: &RingBuffer, uptime: Duration) {
         let t = self.collector.snapshot();
         let latency_ms =
             self.last_input_pts.saturating_sub(self.last_output_pts) as f64 / 1_000_000.0;
-        eprintln!(
-            "{{\"latency_ms\":{:.3},\"buffer_fill_ratio\":{:.3},\"dropped_frames\":{},\"duplicated_frames\":{},\"jitter_ms\":{:.3},\"frames_in\":{},\"frames_out\":{},\"degraded_stage\":{},\"degrade_events\":{}}}",
+        let window_max_ms = self.collector.take_proc_window_max_ms();
+        let search_px = self
+            .detector
+            .as_ref()
+            .map(|d| d.max_shift_px())
+            .unwrap_or(0);
+        let row = PeriodicRow {
+            uptime,
             latency_ms,
-            ring.fill_ratio(),
-            self.sync.dropped_frames(),
-            self.sync.duplicated_frames(),
-            t.jitter_ms,
-            t.frames_in,
-            self.frames_out,
-            self.controller.stage(),
-            self.controller.events()
-        );
+            buffer_fill_ratio: ring.fill_ratio(),
+            dropped: self.sync.dropped_frames(),
+            duplicated: self.sync.duplicated_frames(),
+            jitter_ms: t.jitter_ms,
+            frames_in: t.frames_in,
+            frames_out: self.frames_out,
+            degraded_stage: self.controller.stage(),
+            degrade_events: self.controller.events(),
+            drift_ppm: self.sync.drift_ppm_estimate(),
+            relock_active: self.sync.relock_active(),
+            signal_lost: self.guard.is_lost(),
+            proc_ms: t.proc_ms,
+            proc_ms_max_1s: window_max_ms,
+            deadline_misses: t.deadline_misses,
+            jitter_search_px: search_px,
+            signal_loss_events: self.signal_loss_events,
+        };
+        let line = match cfg.telemetry_format {
+            config::TelemetryFormat::Json => format_periodic_json(&row),
+            config::TelemetryFormat::Csv => format_periodic_csv(&row),
+        };
+        eprintln!("{line}");
     }
+
+    /// Record a signal-guard transition for telemetry (Issue #36):
+    /// count episodes, accumulate lost time, and print an event row
+    /// immediately, in the active format.
+    fn note_guard_event(&mut self, cfg: &config::CliConfig, event: GuardEvent, uptime: Duration) {
+        let name = match event {
+            GuardEvent::SignalLost => {
+                self.signal_loss_events += 1;
+                self.lost_since = Some(Instant::now());
+                "signal_lost"
+            }
+            GuardEvent::SignalRecovered => {
+                if let Some(since) = self.lost_since.take() {
+                    self.signal_lost_ms_total += since.elapsed().as_millis() as u64;
+                }
+                "signal_recovered"
+            }
+        };
+        let t = self.collector.snapshot();
+        let line = match cfg.telemetry_format {
+            config::TelemetryFormat::Json => format_event_json(
+                name,
+                uptime,
+                t.frames_in,
+                self.frames_out,
+                self.signal_loss_events,
+            ),
+            config::TelemetryFormat::Csv => format_event_csv(
+                name,
+                uptime,
+                t.frames_in,
+                self.frames_out,
+                self.signal_loss_events,
+            ),
+        };
+        eprintln!("{line}");
+    }
+
+    /// Print the end-of-run summary row (Issue #36). Called exactly
+    /// once, on every normal exit path.
+    fn report_summary(&self, cfg: &config::CliConfig, runtime: Duration) {
+        let t = self.collector.snapshot();
+        let mut lost_ms = self.signal_lost_ms_total;
+        if let Some(since) = self.lost_since {
+            lost_ms += since.elapsed().as_millis() as u64;
+        }
+        let row = SummaryRow {
+            runtime,
+            frames_in: t.frames_in,
+            frames_out: self.frames_out,
+            dropped: self.sync.dropped_frames(),
+            duplicated: self.sync.duplicated_frames(),
+            signal_loss_events: self.signal_loss_events,
+            signal_lost_ms: lost_ms,
+            proc_ms_avg: self.collector.proc_avg_ms(),
+            proc_ms_max: self.collector.proc_max_ms(),
+            proc_samples: self.collector.proc_samples(),
+            signal_lost: self.guard.is_lost(),
+        };
+        let line = match cfg.telemetry_format {
+            config::TelemetryFormat::Json => format_summary_json(&row),
+            config::TelemetryFormat::Csv => format_summary_csv(&row),
+        };
+        eprintln!("{line}");
+    }
+}
+
+/// One periodic telemetry sample (Issue #36).
+struct PeriodicRow {
+    uptime: Duration,
+    latency_ms: f64,
+    buffer_fill_ratio: f64,
+    dropped: u64,
+    duplicated: u64,
+    jitter_ms: f64,
+    frames_in: u64,
+    frames_out: u64,
+    degraded_stage: u8,
+    degrade_events: u64,
+    drift_ppm: i64,
+    relock_active: bool,
+    signal_lost: bool,
+    proc_ms: f64,
+    proc_ms_max_1s: f64,
+    deadline_misses: u64,
+    jitter_search_px: u32,
+    signal_loss_events: u64,
+}
+
+/// The end-of-run telemetry summary (Issue #36).
+struct SummaryRow {
+    runtime: Duration,
+    frames_in: u64,
+    frames_out: u64,
+    dropped: u64,
+    duplicated: u64,
+    signal_loss_events: u64,
+    signal_lost_ms: u64,
+    proc_ms_avg: f64,
+    proc_ms_max: f64,
+    proc_samples: u64,
+    signal_lost: bool,
+}
+
+/// CSV column schema shared by every telemetry row kind, so a CSV
+/// stream parses as one table (Issue #36).
+const CSV_COLUMNS: [&str; 24] = [
+    "type",
+    "uptime_s",
+    "event",
+    "latency_ms",
+    "buffer_fill_ratio",
+    "dropped_frames",
+    "duplicated_frames",
+    "jitter_ms",
+    "frames_in",
+    "frames_out",
+    "degraded_stage",
+    "degrade_events",
+    "drift_ppm",
+    "relock_active",
+    "signal_lost",
+    "proc_ms",
+    "proc_ms_max_1s",
+    "deadline_misses",
+    "jitter_search_px",
+    "signal_loss_events",
+    "runtime_s",
+    "proc_ms_avg",
+    "proc_ms_max",
+    "signal_lost_ms",
+];
+
+fn csv_header() -> String {
+    CSV_COLUMNS.join(",")
+}
+
+fn csv_row(fill: &[(usize, String)]) -> String {
+    let mut cells = vec![String::new(); CSV_COLUMNS.len()];
+    for (idx, value) in fill {
+        cells[*idx] = value.clone();
+    }
+    cells.join(",")
+}
+
+fn format_periodic_json(r: &PeriodicRow) -> String {
+    format!(
+        "{{\"type\":\"periodic\",\"uptime_s\":{:.3},\"latency_ms\":{:.3},\"buffer_fill_ratio\":{:.3},\"dropped_frames\":{},\"duplicated_frames\":{},\"jitter_ms\":{:.3},\"frames_in\":{},\"frames_out\":{},\"degraded_stage\":{},\"degrade_events\":{},\"drift_ppm\":{},\"relock_active\":{},\"signal_lost\":{},\"proc_ms\":{:.3},\"proc_ms_max_1s\":{:.3},\"deadline_misses\":{},\"jitter_search_px\":{},\"signal_loss_events\":{}}}",
+        r.uptime.as_secs_f64(),
+        r.latency_ms,
+        r.buffer_fill_ratio,
+        r.dropped,
+        r.duplicated,
+        r.jitter_ms,
+        r.frames_in,
+        r.frames_out,
+        r.degraded_stage,
+        r.degrade_events,
+        r.drift_ppm,
+        r.relock_active,
+        r.signal_lost,
+        r.proc_ms,
+        r.proc_ms_max_1s,
+        r.deadline_misses,
+        r.jitter_search_px,
+        r.signal_loss_events
+    )
+}
+
+fn format_periodic_csv(r: &PeriodicRow) -> String {
+    csv_row(&[
+        (0, "periodic".to_string()),
+        (1, format!("{:.3}", r.uptime.as_secs_f64())),
+        (3, format!("{:.3}", r.latency_ms)),
+        (4, format!("{:.3}", r.buffer_fill_ratio)),
+        (5, r.dropped.to_string()),
+        (6, r.duplicated.to_string()),
+        (7, format!("{:.3}", r.jitter_ms)),
+        (8, r.frames_in.to_string()),
+        (9, r.frames_out.to_string()),
+        (10, r.degraded_stage.to_string()),
+        (11, r.degrade_events.to_string()),
+        (12, r.drift_ppm.to_string()),
+        (13, r.relock_active.to_string()),
+        (14, r.signal_lost.to_string()),
+        (15, format!("{:.3}", r.proc_ms)),
+        (16, format!("{:.3}", r.proc_ms_max_1s)),
+        (17, r.deadline_misses.to_string()),
+        (18, r.jitter_search_px.to_string()),
+        (19, r.signal_loss_events.to_string()),
+    ])
+}
+
+fn format_event_json(
+    name: &str,
+    uptime: Duration,
+    frames_in: u64,
+    frames_out: u64,
+    signal_loss_events: u64,
+) -> String {
+    format!(
+        "{{\"type\":\"event\",\"event\":\"{name}\",\"uptime_s\":{:.3},\"frames_in\":{},\"frames_out\":{},\"signal_loss_events\":{}}}",
+        uptime.as_secs_f64(),
+        frames_in,
+        frames_out,
+        signal_loss_events
+    )
+}
+
+fn format_event_csv(
+    name: &str,
+    uptime: Duration,
+    frames_in: u64,
+    frames_out: u64,
+    signal_loss_events: u64,
+) -> String {
+    csv_row(&[
+        (0, "event".to_string()),
+        (1, format!("{:.3}", uptime.as_secs_f64())),
+        (2, name.to_string()),
+        (8, frames_in.to_string()),
+        (9, frames_out.to_string()),
+        (19, signal_loss_events.to_string()),
+    ])
+}
+
+fn format_summary_json(r: &SummaryRow) -> String {
+    format!(
+        "{{\"type\":\"summary\",\"runtime_s\":{:.3},\"frames_in\":{},\"frames_out\":{},\"dropped_frames\":{},\"duplicated_frames\":{},\"signal_loss_events\":{},\"signal_lost_ms\":{},\"proc_ms_avg\":{:.3},\"proc_ms_max\":{:.3},\"proc_samples\":{},\"signal_lost\":{}}}",
+        r.runtime.as_secs_f64(),
+        r.frames_in,
+        r.frames_out,
+        r.dropped,
+        r.duplicated,
+        r.signal_loss_events,
+        r.signal_lost_ms,
+        r.proc_ms_avg,
+        r.proc_ms_max,
+        r.proc_samples,
+        r.signal_lost
+    )
+}
+
+fn format_summary_csv(r: &SummaryRow) -> String {
+    csv_row(&[
+        (0, "summary".to_string()),
+        (1, format!("{:.3}", r.runtime.as_secs_f64())),
+        (5, r.dropped.to_string()),
+        (6, r.duplicated.to_string()),
+        (8, r.frames_in.to_string()),
+        (9, r.frames_out.to_string()),
+        (14, r.signal_lost.to_string()),
+        (19, r.signal_loss_events.to_string()),
+        (20, format!("{:.3}", r.runtime.as_secs_f64())),
+        (21, format!("{:.3}", r.proc_ms_avg)),
+        (22, format!("{:.3}", r.proc_ms_max)),
+        (23, r.signal_lost_ms.to_string()),
+    ])
 }
 
 fn run(cfg: &config::CliConfig) -> i32 {
@@ -733,7 +1018,19 @@ fn run(cfg: &config::CliConfig) -> i32 {
         prev_dropped: 0,
         prev_duplicated: 0,
         output_error: false,
+        signal_loss_events: 0,
+        lost_since: None,
+        signal_lost_ms_total: 0,
     };
+    // Processing deadline for telemetry: the target frame interval
+    // (Issue #36).
+    pipe.collector.set_deadline_ns(
+        ((core.target_rate.den as u128 * 1_000_000_000) / core.target_rate.num as u128) as u64,
+    );
+    let run_started = Instant::now();
+    if cfg.telemetry_format == config::TelemetryFormat::Csv {
+        eprintln!("{}", csv_header());
+    }
     let mut last_ingest_seq: Option<u64> = None;
     let mut last_telemetry = Instant::now();
     let mut stopped = false;
@@ -744,11 +1041,15 @@ fn run(cfg: &config::CliConfig) -> i32 {
                 pipe.collector.note_input(frame.pts_ns);
                 pipe.last_input_pts = frame.pts_ns;
                 last_ingest_seq = Some(frame.sequence);
-                if frame.validate().is_ok() {
-                    pipe.guard.note_good_frame(&frame);
+                let guard_event = if frame.validate().is_ok() {
+                    let event = pipe.guard.note_good_frame(&frame);
                     pipe.sync.ingest(frame);
+                    event
                 } else {
-                    pipe.guard.note_bad_frame();
+                    pipe.guard.note_bad_frame()
+                };
+                if let Some(event) = guard_event {
+                    pipe.note_guard_event(cfg, event, run_started.elapsed());
                 }
                 // Fold the synchronizer's cumulative counters into the
                 // collector as deltas.
@@ -762,7 +1063,9 @@ fn run(cfg: &config::CliConfig) -> i32 {
 
                 let started = Instant::now();
                 let keep_going = pipe.process_output(cfg, &mut sink);
-                pipe.controller.observe(started.elapsed().as_nanos() as u64);
+                let proc_ns = started.elapsed().as_nanos() as u64;
+                pipe.controller.observe(proc_ns);
+                pipe.collector.note_processing_time(proc_ns);
                 let want_hold_drop = pipe.controller.force_hold_drop();
                 if want_hold_drop != pipe.applied_hold_drop {
                     pipe.sync.set_rate_policy(if want_hold_drop {
@@ -787,7 +1090,7 @@ fn run(cfg: &config::CliConfig) -> i32 {
         if cfg.telemetry_interval_ms > 0
             && last_telemetry.elapsed().as_millis() >= cfg.telemetry_interval_ms as u128
         {
-            pipe.report_telemetry(&ring);
+            pipe.report_telemetry(cfg, &ring, run_started.elapsed());
             last_telemetry = Instant::now();
         }
     }
@@ -815,18 +1118,21 @@ fn run(cfg: &config::CliConfig) -> i32 {
     let _ = sink.flush();
     let _ = reader_thread.join();
 
-    if pipe.output_error {
-        return 3;
-    }
-    if let Some(e) = reader_error.lock().expect("error slot").take() {
+    let code = if pipe.output_error {
+        3
+    } else if let Some(e) = reader_error.lock().expect("error slot").take() {
         eprintln!("software-tbc: input error: {e}");
-        return 3;
-    }
-    if cfg.fail_on_signal_loss && pipe.guard.is_lost() {
+        3
+    } else if cfg.fail_on_signal_loss && pipe.guard.is_lost() {
         eprintln!("software-tbc: ended in signal-loss state");
-        return 4;
-    }
-    0
+        4
+    } else {
+        0
+    };
+    // End-of-run summary, exactly once on every normal exit path
+    // (Issue #36).
+    pipe.report_summary(cfg, run_started.elapsed());
+    code
 }
 
 #[cfg(test)]
@@ -1111,6 +1417,9 @@ mod tests {
             prev_dropped: 0,
             prev_duplicated: 0,
             output_error: false,
+            signal_loss_events: 0,
+            lost_since: None,
+            signal_lost_ms_total: 0,
         }
     }
 
@@ -1162,6 +1471,79 @@ mod tests {
         let out = run_one(&cfg, &mut pipe);
         assert_eq!(out.len(), 1);
         assert_ne!(out[0].data, frame_4x2().data);
+    }
+
+    fn sample_periodic() -> PeriodicRow {
+        PeriodicRow {
+            uptime: Duration::from_millis(1500),
+            latency_ms: 33.367,
+            buffer_fill_ratio: 0.5,
+            dropped: 1,
+            duplicated: 2,
+            jitter_ms: 0.123,
+            frames_in: 100,
+            frames_out: 99,
+            degraded_stage: 0,
+            degrade_events: 0,
+            drift_ppm: 123,
+            relock_active: true,
+            signal_lost: false,
+            proc_ms: 1.234,
+            proc_ms_max_1s: 2.345,
+            deadline_misses: 0,
+            jitter_search_px: 8,
+            signal_loss_events: 0,
+        }
+    }
+
+    fn sample_summary() -> SummaryRow {
+        SummaryRow {
+            runtime: Duration::from_millis(2500),
+            frames_in: 100,
+            frames_out: 99,
+            dropped: 1,
+            duplicated: 2,
+            signal_loss_events: 1,
+            signal_lost_ms: 1200,
+            proc_ms_avg: 1.5,
+            proc_ms_max: 9.5,
+            proc_samples: 42,
+            signal_lost: false,
+        }
+    }
+
+    #[test]
+    fn telemetry_json_rows_have_stable_shape() {
+        let p = format_periodic_json(&sample_periodic());
+        assert!(p.starts_with("{\"type\":\"periodic\""), "{p}");
+        assert!(p.contains("\"drift_ppm\":123"), "{p}");
+        assert!(p.contains("\"relock_active\":true"), "{p}");
+        assert!(p.contains("\"proc_ms_max_1s\":2.345"), "{p}");
+        let e = format_event_json("signal_lost", Duration::from_millis(2500), 10, 9, 1);
+        assert!(e.starts_with("{\"type\":\"event\""), "{e}");
+        assert!(e.contains("\"event\":\"signal_lost\""), "{e}");
+        assert!(e.contains("\"signal_loss_events\":1"), "{e}");
+        let s = format_summary_json(&sample_summary());
+        assert!(s.starts_with("{\"type\":\"summary\""), "{s}");
+        assert!(s.contains("\"proc_samples\":42"), "{s}");
+        assert!(s.contains("\"signal_lost_ms\":1200"), "{s}");
+    }
+
+    #[test]
+    fn telemetry_csv_rows_share_the_header_column_count() {
+        let n = csv_header().split(',').count();
+        assert_eq!(n, CSV_COLUMNS.len());
+        let rows = [
+            format_periodic_csv(&sample_periodic()),
+            format_event_csv("signal_lost", Duration::from_millis(2500), 10, 9, 1),
+            format_summary_csv(&sample_summary()),
+        ];
+        for row in &rows {
+            assert_eq!(row.split(',').count(), n, "row: {row}");
+        }
+        assert!(rows[0].starts_with("periodic,"));
+        assert!(rows[1].starts_with("event,"));
+        assert!(rows[2].starts_with("summary,"));
     }
 
     #[test]
