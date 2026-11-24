@@ -506,6 +506,7 @@ pub fn parse_signal_loss(s: &str) -> Result<SignalLossPolicy, String> {
         "last-frame-hold" => Ok(SignalLossPolicy::LastFrameHold),
         "blackout" => Ok(SignalLossPolicy::Blackout),
         "test-pattern" => Ok(SignalLossPolicy::TestPattern),
+        "passthrough" => Ok(SignalLossPolicy::Passthrough),
         other => Err(format!("unknown signal_loss '{other}'")),
     }
 }
@@ -579,6 +580,9 @@ pub fn resolve(args: &Args) -> Result<CliConfig, String> {
     }
     if let Some(s) = &args.stamp {
         o.stamp = Some(parse_stamp_mode(s)?);
+    }
+    if let Some(s) = &args.signal_loss {
+        o.signal_loss = Some(parse_signal_loss(s)?);
     }
     o.apply_to(&mut cfg);
 
@@ -722,6 +726,7 @@ mod tests {
             standard: None,
             config: config.map(str::to_string),
             stamp: None,
+            signal_loss: None,
             no_overload_fallback: false,
             auto_adapt: false,
             max_frames: None,
@@ -759,6 +764,45 @@ mod tests {
         // Odd processing height is rejected for the 4:2:0 class.
         a.height = Some(479);
         assert!(resolve(&a).is_err());
+    }
+
+    #[test]
+    fn signal_loss_passthrough_layers() {
+        assert_eq!(
+            parse_signal_loss("passthrough").expect("parse passthrough"),
+            SignalLossPolicy::Passthrough
+        );
+        // Default is last-frame-hold.
+        let a = args(None, None);
+        assert_eq!(
+            resolve(&a).expect("resolve").core.signal_loss,
+            SignalLossPolicy::LastFrameHold
+        );
+        // TOML selects passthrough.
+        let dir = std::env::temp_dir().join(format!("software-tbc-cli-sl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("tbc.toml");
+        std::fs::write(&path, "signal_loss = \"passthrough\"\n").expect("write toml");
+        let a = args(None, path.to_str());
+        assert_eq!(
+            resolve(&a).expect("resolve").core.signal_loss,
+            SignalLossPolicy::Passthrough
+        );
+        // The CLI flag overrides TOML, and TOML overrides the flag's
+        // absence only (an explicit CLI choice always wins).
+        let mut a = args(None, path.to_str());
+        a.signal_loss = Some("blackout".to_string());
+        assert_eq!(
+            resolve(&a).expect("resolve").core.signal_loss,
+            SignalLossPolicy::Blackout
+        );
+        let mut a = args(None, None);
+        a.signal_loss = Some("passthrough".to_string());
+        assert_eq!(
+            resolve(&a).expect("resolve").core.signal_loss,
+            SignalLossPolicy::Passthrough
+        );
+        assert!(parse_signal_loss("freeze").is_err());
     }
 
     #[test]
