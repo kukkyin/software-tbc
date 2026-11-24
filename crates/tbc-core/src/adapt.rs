@@ -75,6 +75,8 @@ pub struct RangeEstimator {
     frames: u32,
     win_min: u8,
     win_max: u8,
+    seen_min: u8,
+    seen_max: u8,
     full_streak: u32,
     limited_streak: u32,
 }
@@ -86,6 +88,8 @@ impl RangeEstimator {
             frames: 0,
             win_min: u8::MAX,
             win_max: u8::MIN,
+            seen_min: u8::MAX,
+            seen_max: u8::MIN,
             full_streak: 0,
             limited_streak: 0,
         }
@@ -96,10 +100,24 @@ impl RangeEstimator {
         self.current
     }
 
+    /// Luma range over every frame observed so far, or `None`
+    /// before the first scannable frame (Issue #37: the analysis
+    /// report reuses the estimator's own observations instead of
+    /// scanning the frames a second time).
+    pub fn observed_range(&self) -> Option<(u8, u8)> {
+        if self.seen_min <= self.seen_max {
+            Some((self.seen_min, self.seen_max))
+        } else {
+            None
+        }
+    }
+
     /// Observe one frame. Returns the new classification at the
     /// moment it changes, `None` otherwise.
     pub fn observe(&mut self, frame: &VideoFrame) -> Option<RangeClass> {
         let (min, max) = luma_min_max(frame)?;
+        self.seen_min = self.seen_min.min(min);
+        self.seen_max = self.seen_max.max(max);
         self.win_min = self.win_min.min(min);
         self.win_max = self.win_max.max(max);
         self.frames += 1;
@@ -252,6 +270,20 @@ mod tests {
             pts_ns: 0,
             sequence: 0,
         }
+    }
+
+    #[test]
+    fn observed_range_accumulates_over_all_frames() {
+        let mut est = RangeEstimator::new();
+        assert_eq!(est.observed_range(), None);
+        let _ = est.observe(&frame_with_extremes(16, 235));
+        assert_eq!(est.observed_range(), Some((16, 235)));
+        // A later, narrower frame does not shrink the range; a
+        // wider one extends it, across window boundaries too.
+        let _ = est.observe(&frame_with_extremes(40, 100));
+        assert_eq!(est.observed_range(), Some((16, 235)));
+        feed(&mut est, &frame_with_extremes(4, 250), 40);
+        assert_eq!(est.observed_range(), Some((4, 250)));
     }
 
     fn feed(est: &mut RangeEstimator, frame: &VideoFrame, n: u32) -> Option<RangeClass> {
