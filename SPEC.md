@@ -213,10 +213,23 @@ pub enum TbcError { FrameSizeMismatch{..}, InvalidConfig(String), SignalLost }
 - `dropped_frames` / `duplicated_frames`: 累計
 - `jitter_ms`: 到着間隔の標準偏差（Welford法でオンライン推定）
 - `frames_in` / `frames_out`: 累計
+- `proc_ms` / `deadline_misses`: 出力1フレームあたり処理時間の EMA（α=1/16）と、
+  目標フレーム間隔を超えた処理の累計回数（Issue #36）。収集器はこのほか窓最大・
+  全期間最大・全期間平均のための整数ナノ秒統計を保持する
 
 出力経路: `tbc-core` は `TelemetrySink` トレイト（`fn report(&mut self, &Telemetry)`）を受け取り、
-周期は呼び出し側が決める。`tbc-cli` は1秒間隔で JSON Lines として stderr に出す
-（`tracing` + 構造化フィールド。フォーマットは §7 の `telemetry_interval_ms` で制御）。
+周期は呼び出し側が決める。`tbc-cli` は1秒間隔で stderr に出す（周期は §7 の
+`telemetry_interval_ms` で制御）。形式は `telemetry_format`（`json` 既定 / `csv`）で
+切り替える（Issue #36）。行の種類は3つ:
+- 周期行（`type: "periodic"`）: 上記スナップショットに `uptime_s`（単調時計の経過秒）、
+  `drift_ppm`、`relock_active`、`signal_lost`、`proc_ms_max_1s`（前回出力以降の窓最大）、
+  `jitter_search_px`、信号断エピソード数を加えたもの
+- イベント行（`type: "event"`）: 信号ガードの喪失/復帰遷移を即時に出す。
+  復帰していないのに復帰イベントは出さない
+- サマリ行（`type: "summary"`）: 終了時に1回だけ、総フレーム数・ドロップ/重複・
+  信号断回数と合計時間・処理時間の平均/最大・終了時点の信号断有無を出す
+CSV は全行で共通の固定カラム（先頭が `type`、該当しない列は空欄）とし、起動時に
+ヘッダ行を1回出す。
 
 ### 4.7 ヘッドスイッチングマスク（`head_switch.rs`）
 
@@ -301,6 +314,7 @@ CLI（`tbc-cli`、バイナリ名 `software-tbc`）:
   `--field-order progressive|top-first|bottom-first|auto`、
   `--head-switch-lines N`、`--head-switch-mode replicate|interpolate`、`--auto-adapt`、
   `--signal-loss last-frame-hold|blackout|test-pattern|passthrough`（§4.5）、
+  `--telemetry-format json|csv`（§4.6）、
   幾何分離（§4.8）: `--input-width/--input-height`、`--crop-left/--crop-top`、
   `--output-width/--output-height`、`--pad-left/--pad-top`。
   優先順位: CLI引数 > 設定ファイル > プリセット > 既定値。
@@ -368,6 +382,7 @@ head_switch_mode = "replicate"  # replicate | interpolate
 signal_loss = "last-frame-hold" # last-frame-hold | blackout | test-pattern | passthrough（信号断中は無加工送出、§4.5）
 signal_loss_timeout_ms = 200
 telemetry_interval_ms = 1000
+telemetry_format = "json" # json | csv（§4.6）
 stamp = "nominal"               # nominal | wall-clock（§6、Issue #20）
 auto_adapt = false              # 自動適応（§4.9、Issue #32）
 
