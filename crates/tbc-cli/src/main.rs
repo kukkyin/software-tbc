@@ -15,13 +15,14 @@ use std::io::{BufReader, BufWriter, Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+use tbc_core::field::FieldOrderDetector;
 use tbc_core::guard::SignalGuard;
 use tbc_core::jitter::{apply_shifts, JitterDetector};
 use tbc_core::procamp::ProcAmp;
 use tbc_core::sync::ring::RingBuffer;
 use tbc_core::sync::FrameSynchronizer;
 use tbc_core::telemetry::TelemetryCollector;
-use tbc_core::{FrameRate, PixelFormat, RatePolicy, TbcError, VideoFrame};
+use tbc_core::{FieldOrder, FrameRate, PixelFormat, RatePolicy, TbcError, VideoFrame};
 use tbc_io::{
     FrameSink, FrameSource, IoError, RawGeometry, RawReader, RawWriter, SequenceSink,
     SequenceSource,
@@ -50,6 +51,11 @@ pub struct Args {
     /// Pixel format: yuv420p | yuv422p | rgb24 | uyvy | yuyv.
     #[arg(long)]
     format: Option<String>,
+    /// Field order: progressive | top-first | bottom-first | auto
+    /// (detect from the stream; the otherwise-configured order is
+    /// the fallback until detection locks).
+    #[arg(long)]
+    field_order: Option<String>,
     /// Named preset: vhs | svhs | unstable-composite | low-latency.
     #[arg(long)]
     preset: Option<String>,
@@ -297,6 +303,10 @@ struct Pipeline {
     guard: SignalGuard,
     collector: TelemetryCollector,
     controller: OverloadController,
+    /// Auto field-order mode (Issue #26): the reader thread's
+    /// detector publishes the effective order here, and `emit` tags
+    /// every output frame with it. `None` outside auto mode.
+    auto_order: Option<Arc<Mutex<FieldOrder>>>,
     applied_hold_drop: bool,
     frames_out: u64,
     last_emitted_seq: Option<u64>,
@@ -314,8 +324,13 @@ impl Pipeline {
         &mut self,
         cfg: &config::CliConfig,
         sink: &mut Box<dyn FrameSink + Send>,
-        out: VideoFrame,
+        mut out: VideoFrame,
     ) -> bool {
+        // In auto mode every output frame carries the currently
+        // effective field order (Issue #26).
+        if let Some(shared) = &self.auto_order {
+            out.field_order = *shared.lock().expect("order slot");
+        }
         // Every output frame leaves in the declared wire format,
         // including guard fallbacks (Issue #24).
         let out = match to_wire_frame(cfg.core.format, out) {
@@ -443,6 +458,11 @@ fn run(cfg: &config::CliConfig) -> i32 {
         cfg.stamp
     };
 
+    // In auto field-order mode the reader thread runs the detector
+    // and publishes its decision here; the value starts at the
+    // configured fallback order (Issue #26).
+    let effective_order = Arc::new(Mutex::new(cfg.core.field_order));
+
     // Reader thread: stamp each frame (raw streams carry no timestamps
     // of their own) and push it into the ring.
     let reader_thread = {
@@ -450,8 +470,15 @@ fn run(cfg: &config::CliConfig) -> i32 {
         let input_done = Arc::clone(&input_done);
         let stop_reader = Arc::clone(&stop_reader);
         let reader_error = Arc::clone(&reader_error);
+        let effective_order = Arc::clone(&effective_order);
+        let auto_detect = cfg.field_order_auto;
         let rate = core.target_rate;
         std::thread::spawn(move || {
+            let mut detector = if auto_detect {
+                Some(FieldOrderDetector::new())
+            } else {
+                None
+            };
             let mut stamper = Stamper::new(stamp_mode, rate);
             let mut sequence = 0u64;
             'read: loop {
@@ -470,6 +497,11 @@ fn run(cfg: &config::CliConfig) -> i32 {
                                         Some(IoError::Core(e));
                                     break 'read;
                                 }
+                            }
+                        }
+                        if let Some(det) = detector.as_mut() {
+                            if let Some(order) = det.observe(&frame) {
+                                *effective_order.lock().expect("order slot") = order;
                             }
                         }
                         frame.pts_ns = stamper.stamp(Instant::now());
@@ -515,6 +547,7 @@ fn run(cfg: &config::CliConfig) -> i32 {
             core.rate_policy == RatePolicy::Blend,
             ((core.target_rate.den as u128 * 1_000_000_000) / core.target_rate.num as u128) as u64,
         ),
+        auto_order: cfg.field_order_auto.then(|| Arc::clone(&effective_order)),
         applied_hold_drop: false,
         frames_out: 0,
         last_emitted_seq: None,
