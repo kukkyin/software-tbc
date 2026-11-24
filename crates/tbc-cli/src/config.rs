@@ -5,6 +5,7 @@
 //! the fields they actually set.
 
 use serde::Deserialize;
+use tbc_core::head_switch::HeadSwitchMode;
 use tbc_core::{FieldOrder, FrameRate, PixelFormat, RatePolicy, SignalLossPolicy, TbcConfig};
 
 use crate::Args;
@@ -72,6 +73,8 @@ struct Overrides {
     rate_policy: Option<RatePolicy>,
     buffer_frames: Option<usize>,
     jitter_correction: Option<bool>,
+    head_switch_lines: Option<u32>,
+    head_switch_mode: Option<HeadSwitchMode>,
     signal_loss: Option<SignalLossPolicy>,
     signal_loss_timeout_ms: Option<u64>,
     telemetry_interval_ms: Option<u64>,
@@ -119,6 +122,12 @@ impl Overrides {
         }
         if let Some(v) = self.jitter_correction {
             core.jitter_correction = v;
+        }
+        if let Some(v) = self.head_switch_lines {
+            core.head_switch.lines = v;
+        }
+        if let Some(v) = self.head_switch_mode {
+            core.head_switch.mode = v;
         }
         if let Some(v) = self.signal_loss {
             core.signal_loss = v;
@@ -240,6 +249,8 @@ struct TomlConfig {
     rate_policy: Option<String>,
     buffer_frames: Option<usize>,
     jitter_correction: Option<bool>,
+    head_switch_lines: Option<u32>,
+    head_switch_mode: Option<String>,
     signal_loss: Option<String>,
     signal_loss_timeout_ms: Option<u64>,
     telemetry_interval_ms: Option<u64>,
@@ -266,6 +277,7 @@ impl TomlConfig {
             height: self.height,
             buffer_frames: self.buffer_frames,
             jitter_correction: self.jitter_correction,
+            head_switch_lines: self.head_switch_lines,
             signal_loss_timeout_ms: self.signal_loss_timeout_ms,
             telemetry_interval_ms: self.telemetry_interval_ms,
             max_shift_px: self.max_shift_px,
@@ -283,6 +295,9 @@ impl TomlConfig {
         }
         if let Some(s) = self.rate_policy {
             o.rate_policy = Some(parse_rate_policy(&s)?);
+        }
+        if let Some(s) = self.head_switch_mode {
+            o.head_switch_mode = Some(parse_head_switch_mode(&s)?);
         }
         if let Some(s) = self.signal_loss {
             o.signal_loss = Some(parse_signal_loss(&s)?);
@@ -343,6 +358,16 @@ pub fn parse_field_order(s: &str) -> Result<FieldOrder, String> {
 }
 
 /// Parse `30000/1001` or a plain integer rate like `30`.
+pub fn parse_head_switch_mode(s: &str) -> Result<HeadSwitchMode, String> {
+    match s {
+        "replicate" => Ok(HeadSwitchMode::Replicate),
+        "interpolate" => Ok(HeadSwitchMode::Interpolate),
+        other => Err(format!(
+            "unknown head_switch_mode '{other}' (expected: replicate | interpolate)"
+        )),
+    }
+}
+
 pub fn parse_rate(s: &str) -> Result<FrameRate, String> {
     if let Some((num, den)) = s.split_once('/') {
         let num: u32 = num
@@ -434,6 +459,12 @@ pub fn resolve(args: &Args) -> Result<CliConfig, String> {
     if let Some(s) = &args.field_order {
         apply_field_order_setting(&mut o, s)?;
     }
+    if let Some(v) = args.head_switch_lines {
+        o.head_switch_lines = Some(v);
+    }
+    if let Some(s) = &args.head_switch_mode {
+        o.head_switch_mode = Some(parse_head_switch_mode(s)?);
+    }
     if let Some(s) = &args.stamp {
         o.stamp = Some(parse_stamp_mode(s)?);
     }
@@ -466,6 +497,8 @@ mod tests {
             height: None,
             format: None,
             field_order: None,
+            head_switch_lines: None,
+            head_switch_mode: None,
             preset: preset.map(str::to_string),
             standard: None,
             config: config.map(str::to_string),
@@ -579,6 +612,44 @@ mod tests {
         let cfg = resolve(&a).expect("resolve");
         assert!(!cfg.overload_fallback);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn head_switch_resolution() {
+        use tbc_core::head_switch::HeadSwitchMode;
+
+        // Default: disabled.
+        let cfg = resolve(&args(None, None)).expect("resolve");
+        assert_eq!(cfg.core.head_switch.lines, 0);
+
+        // TOML sets both keys.
+        let dir = std::env::temp_dir().join(format!("software-tbc-cli-hs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("tbc.toml");
+        std::fs::write(
+            &path,
+            "head_switch_lines = 6\nhead_switch_mode = \"interpolate\"\n",
+        )
+        .expect("write toml");
+        let cfg = resolve(&args(None, path.to_str())).expect("resolve");
+        assert_eq!(cfg.core.head_switch.lines, 6);
+        assert_eq!(cfg.core.head_switch.mode, HeadSwitchMode::Interpolate);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // CLI flags override TOML layer by layer.
+        let mut a = args(None, None);
+        a.head_switch_lines = Some(3);
+        a.head_switch_mode = Some("replicate".to_string());
+        let cfg = resolve(&a).expect("resolve");
+        assert_eq!(cfg.core.head_switch.lines, 3);
+        assert_eq!(cfg.core.head_switch.mode, HeadSwitchMode::Replicate);
+
+        // Unknown mode and a mask covering the whole frame fail.
+        a.head_switch_mode = Some("smear".to_string());
+        assert!(resolve(&a).is_err());
+        let mut a = args(None, None);
+        a.head_switch_lines = Some(480);
+        assert!(resolve(&a).is_err());
     }
 
     #[test]
