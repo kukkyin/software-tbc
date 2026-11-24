@@ -137,7 +137,7 @@ pub fn black_frame(width: u32, height: u32, format: PixelFormat) -> VideoFrame {
                 chunk.copy_from_slice(&v.to_le_bytes());
             }
         }
-        PixelFormat::Yuv420p => {
+        PixelFormat::Yuv420p | PixelFormat::Nv12 => {
             let y_size = (width * height) as usize;
             for b in &mut frame.data[..y_size] {
                 *b = 16;
@@ -208,6 +208,15 @@ pub fn test_pattern(width: u32, height: u32, format: PixelFormat) -> VideoFrame 
                         frame.data[o] = cr;
                     }
                 }
+            }
+        }
+        PixelFormat::Nv12 => {
+            // Generate the planar pattern and interleave its chroma
+            // planes (Issue #33).
+            if let Ok(interleaved) =
+                VideoFrame::from_yuv420p(&test_pattern(width, height, PixelFormat::Yuv420p), format)
+            {
+                return interleaved;
             }
         }
         PixelFormat::Yuv420p10 | PixelFormat::Yuv422p10 => {
