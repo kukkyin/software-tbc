@@ -21,6 +21,11 @@ pub struct ProcAmpConfig {
     pub hue_degrees: f32,
     /// Gamma applied to Y, 1.0 = none.
     pub gamma: f32,
+    /// Horizontal chroma shift relative to luma, in luma pixels
+    /// (positive moves chroma to the right); compensates the chroma
+    /// delay of composite sources (Issue #30). 0.0 = none. Not
+    /// applied to RGB frames.
+    pub chroma_shift_px: f32,
 }
 
 impl Default for ProcAmpConfig {
@@ -31,6 +36,7 @@ impl Default for ProcAmpConfig {
             saturation: 1.0,
             hue_degrees: 0.0,
             gamma: 1.0,
+            chroma_shift_px: 0.0,
         }
     }
 }
@@ -43,6 +49,28 @@ impl ProcAmpConfig {
             && self.saturation == 1.0
             && self.hue_degrees == 0.0
             && self.gamma == 1.0
+            && self.chroma_shift_px == 0.0
+    }
+}
+
+/// Shift one chroma row by `shift_q8` (Q8 chroma samples; positive
+/// moves the samples to the right), linearly interpolated with the
+/// edges clamped. `scratch` must be at least as long as `row` and
+/// receives a copy of the original row.
+fn shift_chroma_row(row: &mut [u8], scratch: &mut [u8], shift_q8: i32) {
+    if shift_q8 == 0 || row.len() < 2 {
+        return;
+    }
+    scratch[..row.len()].copy_from_slice(row);
+    let n = row.len() as i32;
+    for (i, out) in row.iter_mut().enumerate() {
+        // Source position of this output sample, in Q8 samples.
+        let p = i as i32 * 256 - shift_q8;
+        let j = p.div_euclid(256);
+        let frac = p.rem_euclid(256) as u32;
+        let a = scratch[j.clamp(0, n - 1) as usize] as u32;
+        let b = scratch[(j + 1).clamp(0, n - 1) as usize] as u32;
+        *out = ((a * (256 - frac) + b * frac + 128) >> 8) as u8;
     }
 }
 
@@ -53,6 +81,9 @@ pub struct ProcAmp {
     luma_lut: [u8; 256],
     chroma_cos: f32,
     chroma_sin: f32,
+    /// Chroma shift in Q8 chroma samples (Issue #30). Chroma is at
+    /// half the luma rate horizontally, so one luma pixel is 128.
+    chroma_shift_q8: i32,
 }
 
 impl ProcAmp {
@@ -74,6 +105,9 @@ impl ProcAmp {
             luma_lut,
             chroma_cos: hue_rad.cos(),
             chroma_sin: hue_rad.sin(),
+            chroma_shift_q8: (config.chroma_shift_px * 128.0)
+                .round()
+                .clamp(-2048.0, 2048.0) as i32,
         }
     }
 
@@ -123,7 +157,35 @@ impl ProcAmp {
         }
     }
 
+    /// Shift the interleaved Cb/Cr rows of a packed 4:2:2 frame
+    /// (Issue #30). Two small buffers are allocated per call, only
+    /// when a shift is configured.
+    fn shift_packed_chroma(&self, frame: &mut VideoFrame) {
+        let w = frame.width as usize;
+        let h = frame.height as usize;
+        let cw = w / 2;
+        let mut row = vec![0u8; cw];
+        let mut scratch = vec![0u8; cw];
+        for line in 0..h {
+            let base = line * w * 2;
+            // Cb sits at quad offset 1, Cr at offset 3.
+            for ch in 0..2 {
+                let off = base + 1 + ch * 2;
+                for i in 0..cw {
+                    row[i] = frame.data[off + i * 4];
+                }
+                shift_chroma_row(&mut row, &mut scratch, self.chroma_shift_q8);
+                for i in 0..cw {
+                    frame.data[off + i * 4] = row[i];
+                }
+            }
+        }
+    }
+
     fn apply_yuv422p(&self, frame: &mut VideoFrame) {
+        if self.chroma_shift_q8 != 0 {
+            self.shift_packed_chroma(frame);
+        }
         // Packed quads: Y0 Cb Y1 Cr.
         for quad in frame.data.chunks_exact_mut(4) {
             quad[0] = self.luma_lut[quad[0] as usize];
@@ -140,8 +202,16 @@ impl ProcAmp {
         for px in y_plane.iter_mut() {
             *px = self.luma_lut[*px as usize];
         }
-        // Cb and Cr are separate planes of equal size.
+        // Cb and Cr are separate planes of equal size; shift every
+        // chroma row first when a chroma shift is configured.
         let c_size = chroma.len() / 2;
+        if self.chroma_shift_q8 != 0 {
+            let cw = frame.width as usize / 2;
+            let mut scratch = vec![0u8; cw];
+            for row in chroma.chunks_exact_mut(cw) {
+                shift_chroma_row(row, &mut scratch, self.chroma_shift_q8);
+            }
+        }
         let (cb_plane, cr_plane) = chroma.split_at_mut(c_size);
         for i in 0..c_size {
             let (cb, cr) = self.rotate_chroma(cb_plane[i], cr_plane[i]);
@@ -247,6 +317,83 @@ mod tests {
         let mut f = frame(PixelFormat::Yuv422p, vec![200, 128, 200, 128], 2, 1);
         amp.apply(&mut f);
         assert_eq!(f.data[0], 255);
+    }
+
+    /// An 8x1 yuv422p frame: Y all 100, Cb = [10, 20, 30, 40],
+    /// Cr all 200.
+    fn chroma_ramp_422() -> VideoFrame {
+        let mut data = Vec::new();
+        for cb in [10u8, 20, 30, 40] {
+            data.extend_from_slice(&[100, cb, 100, 200]);
+        }
+        frame(PixelFormat::Yuv422p, data, 8, 1)
+    }
+
+    fn cb_row(f: &VideoFrame) -> Vec<u8> {
+        (0..4).map(|i| f.data[i * 4 + 1]).collect()
+    }
+
+    #[test]
+    fn chroma_shift_moves_422_chroma_by_whole_samples() {
+        // +2.0 luma px = +1 chroma sample, edge clamped (Issue #30).
+        let amp = ProcAmp::new(ProcAmpConfig {
+            chroma_shift_px: 2.0,
+            ..Default::default()
+        });
+        let mut f = chroma_ramp_422();
+        amp.apply(&mut f);
+        assert_eq!(cb_row(&f), vec![10, 10, 20, 30]);
+        // Luma and the constant Cr are untouched.
+        assert!((0..4)
+            .all(|i| f.data[i * 4] == 100 && f.data[i * 4 + 2] == 100 && f.data[i * 4 + 3] == 200));
+
+        // -2.0 luma px moves the other way.
+        let amp = ProcAmp::new(ProcAmpConfig {
+            chroma_shift_px: -2.0,
+            ..Default::default()
+        });
+        let mut f = chroma_ramp_422();
+        amp.apply(&mut f);
+        assert_eq!(cb_row(&f), vec![20, 30, 40, 40]);
+    }
+
+    #[test]
+    fn chroma_shift_half_sample_interpolates() {
+        // +1.0 luma px = +0.5 chroma sample: each output is the
+        // average of its two neighbours.
+        let amp = ProcAmp::new(ProcAmpConfig {
+            chroma_shift_px: 1.0,
+            ..Default::default()
+        });
+        let mut f = chroma_ramp_422();
+        amp.apply(&mut f);
+        assert_eq!(cb_row(&f), vec![10, 15, 25, 35]);
+    }
+
+    #[test]
+    fn chroma_shift_applies_to_420_planes() {
+        let amp = ProcAmp::new(ProcAmpConfig {
+            chroma_shift_px: 2.0,
+            ..Default::default()
+        });
+        // 4x2: Y = 100 x8, U = [10, 20], V = [30, 40].
+        let mut data = vec![100u8; 8];
+        data.extend_from_slice(&[10, 20]);
+        data.extend_from_slice(&[30, 40]);
+        let mut f = frame(PixelFormat::Yuv420p, data, 4, 2);
+        amp.apply(&mut f);
+        assert!(f.data[..8].iter().all(|&y| y == 100));
+        assert_eq!(&f.data[8..10], [10, 10]);
+        assert_eq!(&f.data[10..12], [30, 30]);
+    }
+
+    #[test]
+    fn shift_only_config_is_not_neutral() {
+        assert!(!ProcAmpConfig {
+            chroma_shift_px: 1.0,
+            ..Default::default()
+        }
+        .is_neutral());
     }
 
     #[test]
