@@ -21,7 +21,7 @@ use tbc_core::procamp::ProcAmp;
 use tbc_core::sync::ring::RingBuffer;
 use tbc_core::sync::FrameSynchronizer;
 use tbc_core::telemetry::TelemetryCollector;
-use tbc_core::{FrameRate, RatePolicy};
+use tbc_core::{FrameRate, PixelFormat, RatePolicy, TbcError, VideoFrame};
 use tbc_io::{
     FrameSink, FrameSource, IoError, RawGeometry, RawReader, RawWriter, SequenceSink,
     SequenceSource,
@@ -47,7 +47,7 @@ pub struct Args {
     /// Frame height in pixels.
     #[arg(long)]
     height: Option<u32>,
-    /// Pixel format: yuv420p | yuv422p | rgb24.
+    /// Pixel format: yuv420p | yuv422p | rgb24 | uyvy | yuyv.
     #[arg(long)]
     format: Option<String>,
     /// Named preset: vhs | svhs | unstable-composite | low-latency.
@@ -274,6 +274,17 @@ fn open_sink(cfg: &config::CliConfig) -> Result<Box<dyn FrameSink + Send>, IoErr
     Ok(Box::new(RawWriter::new(writer)))
 }
 
+/// Re-pack a pipeline frame into the declared wire format (Issue #24).
+/// Packed formats (uyvy/yuyv) are converted from the pipeline's
+/// yuv422p representation; every other format passes through unchanged.
+fn to_wire_frame(wire: PixelFormat, frame: VideoFrame) -> Result<VideoFrame, TbcError> {
+    if wire.is_packed_422() {
+        VideoFrame::from_yuv422p(&frame, wire)
+    } else {
+        Ok(frame)
+    }
+}
+
 /// Processing-side state: everything the output path touches.
 struct Pipeline {
     sync: FrameSynchronizer,
@@ -299,8 +310,18 @@ impl Pipeline {
         &mut self,
         cfg: &config::CliConfig,
         sink: &mut Box<dyn FrameSink + Send>,
-        out: tbc_core::VideoFrame,
+        out: VideoFrame,
     ) -> bool {
+        // Every output frame leaves in the declared wire format,
+        // including guard fallbacks (Issue #24).
+        let out = match to_wire_frame(cfg.core.format, out) {
+            Ok(frame) => frame,
+            Err(e) => {
+                eprintln!("software-tbc: output conversion error: {e}");
+                self.output_error = true;
+                return false;
+            }
+        };
         if let Err(e) = sink.write_frame(&out) {
             eprintln!("software-tbc: output error: {e}");
             self.output_error = true;
@@ -322,9 +343,16 @@ impl Pipeline {
     ) -> bool {
         if self.guard.is_lost() {
             // Substitute the policy fallback until the signal recovers.
-            if let Some(mut fb) =
-                self.guard
-                    .fallback_frame(cfg.core.width, cfg.core.height, cfg.core.format)
+            // Fallbacks are generated in the pipeline's format; `emit`
+            // re-packs them into the wire format (Issue #24).
+            let format = if cfg.core.format.is_packed_422() {
+                PixelFormat::Yuv422p
+            } else {
+                cfg.core.format
+            };
+            if let Some(mut fb) = self
+                .guard
+                .fallback_frame(cfg.core.width, cfg.core.height, format)
             {
                 fb.sequence = self.frames_out;
                 fb.pts_ns = self.last_output_pts;
@@ -368,7 +396,14 @@ impl Pipeline {
 }
 
 fn run(cfg: &config::CliConfig) -> i32 {
-    let core = cfg.core.clone();
+    let mut core = cfg.core.clone();
+    // Packed boundary formats (uyvy/yuyv) are processed in the
+    // pipeline's yuv422p representation (Issue #24): the reader thread
+    // converts on the way in and `emit` re-packs on the way out.
+    // `cfg.core` keeps the declared wire format for I/O geometry.
+    if core.format.is_packed_422() {
+        core.format = PixelFormat::Yuv422p;
+    }
     let mut source = match open_source(cfg) {
         Ok(s) => s,
         Err(e) => {
@@ -421,6 +456,18 @@ fn run(cfg: &config::CliConfig) -> i32 {
                 }
                 match source.next_frame() {
                     Ok(Some(mut frame)) => {
+                        // Convert packed boundary formats into the
+                        // pipeline's yuv422p representation (Issue #24).
+                        if frame.format.is_packed_422() {
+                            match frame.to_yuv422p() {
+                                Ok(converted) => frame = converted,
+                                Err(e) => {
+                                    *reader_error.lock().expect("error slot") =
+                                        Some(IoError::Core(e));
+                                    break 'read;
+                                }
+                            }
+                        }
                         frame.pts_ns = stamper.stamp(Instant::now());
                         frame.sequence = sequence;
                         sequence += 1;
@@ -692,5 +739,45 @@ mod tests {
         feed(&mut c, 2 * PERIOD, 500);
         assert_eq!(c.stage(), 0);
         assert_eq!(c.events(), 0);
+    }
+
+    fn frame422(data: Vec<u8>) -> VideoFrame {
+        VideoFrame {
+            width: 4,
+            height: 1,
+            format: PixelFormat::Yuv422p,
+            field_order: tbc_core::FieldOrder::Progressive,
+            pts_ns: 0,
+            sequence: 0,
+            data,
+        }
+    }
+
+    #[test]
+    fn wire_frame_repaks_for_packed_formats() {
+        // Pipeline order [Y0, U, Y1, V] -> uyvy [U, Y0, V, Y1].
+        let out = to_wire_frame(
+            PixelFormat::Uyvy,
+            frame422(vec![20, 10, 40, 30, 60, 50, 80, 70]),
+        )
+        .expect("re-pack uyvy");
+        assert_eq!(out.format, PixelFormat::Uyvy);
+        assert_eq!(out.data, vec![10, 20, 30, 40, 50, 60, 70, 80]);
+        // yuyv keeps the byte order and only changes the tag.
+        let out = to_wire_frame(
+            PixelFormat::Yuyv,
+            frame422(vec![20, 10, 40, 30, 60, 50, 80, 70]),
+        )
+        .expect("re-pack yuyv");
+        assert_eq!(out.format, PixelFormat::Yuyv);
+        assert_eq!(out.data, vec![20, 10, 40, 30, 60, 50, 80, 70]);
+    }
+
+    #[test]
+    fn wire_frame_passes_other_formats_through() {
+        let frame = frame422(vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        let out = to_wire_frame(PixelFormat::Yuv422p, frame).expect("passthrough");
+        assert_eq!(out.format, PixelFormat::Yuv422p);
+        assert_eq!(out.data, vec![1, 2, 3, 4, 5, 6, 7, 8]);
     }
 }
