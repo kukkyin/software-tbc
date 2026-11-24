@@ -310,8 +310,10 @@ pub fn parse_format(s: &str) -> Result<PixelFormat, String> {
         "rgb24" => Ok(PixelFormat::Rgb24),
         "uyvy" => Ok(PixelFormat::Uyvy),
         "yuyv" => Ok(PixelFormat::Yuyv),
+        "yuv420p10le" => Ok(PixelFormat::Yuv420p10),
+        "yuv422p10le" => Ok(PixelFormat::Yuv422p10),
         other => Err(format!(
-            "unknown format '{other}' (expected: yuv420p | yuv422p | rgb24 | uyvy | yuyv)"
+            "unknown format '{other}' (expected: yuv420p | yuv422p | rgb24 | uyvy | yuyv | yuv420p10le | yuv422p10le)"
         )),
     }
 }
@@ -672,6 +674,14 @@ mod tests {
         assert_eq!(parse_format("rgb24").expect("rgb"), PixelFormat::Rgb24);
         assert_eq!(parse_format("uyvy").expect("uyvy"), PixelFormat::Uyvy);
         assert_eq!(parse_format("yuyv").expect("yuyv"), PixelFormat::Yuyv);
+        assert_eq!(
+            parse_format("yuv420p10le").expect("420p10"),
+            PixelFormat::Yuv420p10
+        );
+        assert_eq!(
+            parse_format("yuv422p10le").expect("422p10"),
+            PixelFormat::Yuv422p10
+        );
         assert!(parse_format("nv12").is_err());
 
         // A packed format resolves end to end and validates at even width.
@@ -680,6 +690,14 @@ mod tests {
         let cfg = resolve(&a).expect("resolve");
         assert_eq!(cfg.core.format, PixelFormat::Uyvy);
         // ... and is rejected at an odd width.
+        a.width = Some(719);
+        assert!(resolve(&a).is_err());
+
+        // A 10-bit format resolves the same way (Issue #28).
+        let mut a = args(None, None);
+        a.format = Some("yuv422p10le".to_string());
+        let cfg = resolve(&a).expect("resolve");
+        assert_eq!(cfg.core.format, PixelFormat::Yuv422p10);
         a.width = Some(719);
         assert!(resolve(&a).is_err());
     }
