@@ -5,6 +5,7 @@
 //! See `SPEC.md` at the repository root for the full design.
 
 pub mod field;
+pub mod geometry;
 pub mod guard;
 pub mod head_switch;
 pub mod jitter;
