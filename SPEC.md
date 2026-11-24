@@ -206,7 +206,13 @@ pub trait FrameSink   { fn write_frame(&mut self, f: &VideoFrame) -> Result<(), 
 CLI（`tbc-cli`、バイナリ名 `software-tbc`）:
 
 - 引数: `--input`（`-`=stdin）、`--output`（`-`=stdout）、`--width/--height/--format`、
-  `--preset`、`--config`（TOML）。優先順位: CLI引数 > 設定ファイル > プリセット > 既定値。
+  `--preset`、`--config`（TOML）、`--stamp nominal|wall-clock`。
+  優先順位: CLI引数 > 設定ファイル > プリセット > 既定値。
+- `--stamp` は入力フレームの `pts_ns` 生成方式（Issue #20）。`nominal`（既定）は
+  連番×公称レートで決定的。`wall-clock` は到着実時刻（単調クロック、初回フレーム=0）とし、
+  ライブ入力の実ドリフトや到着ジッタを §4.1 の同期・ドリフト推定が見られるようになる。
+  連番ファイル入力には到着時刻が存在しないため、`wall-clock` 指定時は警告して
+  `nominal` にフォールバックする。
 - 標準入出力はバイナリモード固定。Windows では `SetConsoleCP` 等に依存しない
   （パイプ前提のためコンソール入出力は行わない）。
 - 終了コード: 0=正常終了（EOF到達）、2=引数/設定エラー、3=入出力エラー、4=信号断で異常終了
@@ -248,6 +254,7 @@ jitter_correction = true
 signal_loss = "last-frame-hold" # last-frame-hold | blackout | test-pattern
 signal_loss_timeout_ms = 200
 telemetry_interval_ms = 1000
+stamp = "nominal"               # nominal | wall-clock（§6、Issue #20）
 
 [procamp]
 luma_gain = 1.0
