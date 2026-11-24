@@ -329,6 +329,7 @@ fn pipeline_format(wire: PixelFormat) -> PixelFormat {
     match wire {
         PixelFormat::Yuv422p10 => PixelFormat::Yuv422p,
         PixelFormat::Yuv420p10 => PixelFormat::Yuv420p,
+        PixelFormat::Nv12 => PixelFormat::Yuv420p,
         f if f.is_packed_422() => PixelFormat::Yuv422p,
         f => f,
     }
@@ -343,6 +344,8 @@ fn to_wire_frame(wire: PixelFormat, frame: VideoFrame) -> Result<VideoFrame, Tbc
         VideoFrame::from_8bit(&frame, wire)
     } else if wire.is_packed_422() {
         VideoFrame::from_yuv422p(&frame, wire)
+    } else if wire == PixelFormat::Nv12 {
+        VideoFrame::from_yuv420p(&frame, wire)
     } else {
         Ok(frame)
     }
@@ -605,6 +608,18 @@ fn run(cfg: &config::CliConfig) -> i32 {
                         // pipeline's yuv422p representation (Issue #24).
                         if frame.format.is_packed_422() {
                             match frame.to_yuv422p() {
+                                Ok(converted) => frame = converted,
+                                Err(e) => {
+                                    *reader_error.lock().expect("error slot") =
+                                        Some(IoError::Core(e));
+                                    break 'read;
+                                }
+                            }
+                        }
+                        // Convert NV12 into the pipeline's planar
+                        // 4:2:0 representation (Issue #33).
+                        if frame.format == PixelFormat::Nv12 {
+                            match frame.to_yuv420p() {
                                 Ok(converted) => frame = converted,
                                 Err(e) => {
                                     *reader_error.lock().expect("error slot") =
@@ -950,6 +965,25 @@ mod tests {
         .expect("re-pack yuyv");
         assert_eq!(out.format, PixelFormat::Yuyv);
         assert_eq!(out.data, vec![20, 10, 40, 30, 60, 50, 80, 70]);
+    }
+
+    #[test]
+    fn wire_frame_interleaves_for_nv12() {
+        // 4x2 yuv420p: Y = 1..=8, Cb = [101, 102], Cr = [201, 202]
+        // becomes NV12 with the interleaved plane [101, 201, 102, 202].
+        let frame420 = VideoFrame {
+            width: 4,
+            height: 2,
+            format: PixelFormat::Yuv420p,
+            field_order: tbc_core::FieldOrder::Progressive,
+            pts_ns: 0,
+            sequence: 0,
+            data: vec![1, 2, 3, 4, 5, 6, 7, 8, 101, 102, 201, 202],
+        };
+        let out = to_wire_frame(PixelFormat::Nv12, frame420).expect("interleave nv12");
+        assert_eq!(out.format, PixelFormat::Nv12);
+        assert_eq!(out.data, vec![1, 2, 3, 4, 5, 6, 7, 8, 101, 201, 102, 202]);
+        assert_eq!(pipeline_format(PixelFormat::Nv12), PixelFormat::Yuv420p);
     }
 
     #[test]
