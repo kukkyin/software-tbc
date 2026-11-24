@@ -186,6 +186,17 @@ impl SyntheticSource {
             }
             return;
         }
+        if frame.format == PixelFormat::Nv12 {
+            // Jitter the planar equivalent, then interleave back
+            // (Issue #33).
+            if let Ok(mut converted) = frame.to_yuv420p() {
+                self.apply_jitter(&mut converted);
+                if let Ok(back) = VideoFrame::from_yuv420p(&converted, frame.format) {
+                    frame.data.copy_from_slice(&back.data);
+                }
+            }
+            return;
+        }
         // Advance the random walk by at most 1/4 px per line per frame.
         for walk in self.line_walk_q8.iter_mut() {
             *walk = (*walk + self.rng.next_i32(-64, 64)).clamp(-max_q8, max_q8);
@@ -261,8 +272,9 @@ impl SyntheticSource {
             // top of this function), so it never reaches here.
             PixelFormat::Uyvy => {}
             // 10-bit formats are converted and handled before this
-            // match too (Issue #27).
+            // match too (Issue #27), as is Nv12 (Issue #33).
             PixelFormat::Yuv420p10 | PixelFormat::Yuv422p10 => {}
+            PixelFormat::Nv12 => {}
             PixelFormat::Rgb24 => {
                 let w = frame.width as usize;
                 for (line, &shift) in shifts.iter().enumerate() {
@@ -329,7 +341,8 @@ impl SyntheticSource {
                     quad[3] = adjust(quad[3]);
                 }
             }
-            PixelFormat::Yuv420p => {
+            PixelFormat::Yuv420p | PixelFormat::Nv12 => {
+                // Both layouts start with the Y plane.
                 let y_size = (frame.width * frame.height) as usize;
                 for b in &mut frame.data[..y_size] {
                     *b = adjust(*b);
