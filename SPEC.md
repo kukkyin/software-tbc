@@ -231,6 +231,18 @@ pub enum TbcError { FrameSizeMismatch{..}, InvalidConfig(String), SignalLost }
 CSV は全行で共通の固定カラム（先頭が `type`、該当しない列は空欄）とし、起動時に
 ヘッダ行を1回出す。
 
+解析専用モード（`--analyze-only`、Issue #37）: パイプラインをそのまま動かし、
+シンクだけを破棄専用に差し替える。出力パスは開かない（作成・切り捨てしない）。
+周期行・イベント行・サマリはすべて抑制し、終了時に解析レポート（`type: "analysis"`）
+を JSON 1行で **stdout** に出す（通常モードの通知は stderr のみ）。レポートには
+幾何・形式・フレーム数・信号有無と信号断の回数/合計時間・ドリフト（`drift_valid`
+付き）・ジッタ統計・輝度レンジが入る。ジッタ統計は推定が実際に返った標本だけを
+数え（バイパス区間は別計上）、標本 0 のときは null とする。輝度レンジは
+RangeEstimator の観測そのものを使う（解析専用の閾値は作らない）。終了コードは
+信号があれば 0、終了時点で信号断または入力0フレームなら 4（I/O エラー時は 3 の
+まま）。解析モードは出力 I/O を含まないため、処理時間や過負荷フォールバックの
+挙動は通常モードと一致しない（アルゴリズム自体は同一）。
+
 ### 4.7 ヘッドスイッチングマスク（`head_switch.rs`）
 
 VHS 等でフレーム下部に現れるヘッドスイッチングノイズを、直上の正常ラインで
@@ -314,7 +326,7 @@ CLI（`tbc-cli`、バイナリ名 `software-tbc`）:
   `--field-order progressive|top-first|bottom-first|auto`、
   `--head-switch-lines N`、`--head-switch-mode replicate|interpolate`、`--auto-adapt`、
   `--signal-loss last-frame-hold|blackout|test-pattern|passthrough`（§4.5）、
-  `--telemetry-format json|csv`（§4.6）、
+  `--telemetry-format json|csv`（§4.6）、`--analyze-only`（§4.6）、
   幾何分離（§4.8）: `--input-width/--input-height`、`--crop-left/--crop-top`、
   `--output-width/--output-height`、`--pad-left/--pad-top`。
   優先順位: CLI引数 > 設定ファイル > プリセット > 既定値。
@@ -383,6 +395,7 @@ signal_loss = "last-frame-hold" # last-frame-hold | blackout | test-pattern | pa
 signal_loss_timeout_ms = 200
 telemetry_interval_ms = 1000
 telemetry_format = "json" # json | csv（§4.6）
+analyze_only = false # true で解析専用モード（§4.6）
 stamp = "nominal"               # nominal | wall-clock（§6、Issue #20）
 auto_adapt = false              # 自動適応（§4.9、Issue #32）
 
