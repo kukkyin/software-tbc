@@ -51,6 +51,8 @@ pub struct CliConfig {
     pub telemetry_interval_ms: u64,
     pub max_shift_px: u32,
     pub stamp: StampMode,
+    /// Telemetry output format (Issue #36).
+    pub telemetry_format: TelemetryFormat,
     pub overload_fallback: bool,
     /// Auto-adapt mode (Issue #32): range estimation and jitter
     /// search-range adaptation follow the source at runtime.
@@ -78,6 +80,7 @@ impl Default for CliConfig {
             telemetry_interval_ms: 1000,
             max_shift_px: 8,
             stamp: StampMode::Nominal,
+            telemetry_format: TelemetryFormat::Json,
             overload_fallback: true,
             auto_adapt: false,
             input: "-".to_string(),
@@ -115,6 +118,7 @@ struct Overrides {
     telemetry_interval_ms: Option<u64>,
     max_shift_px: Option<u32>,
     stamp: Option<StampMode>,
+    telemetry_format: Option<TelemetryFormat>,
     overload_fallback: Option<bool>,
     auto_adapt: Option<bool>,
     procamp: ProcampOverrides,
@@ -204,6 +208,9 @@ impl Overrides {
         }
         if let Some(v) = self.stamp {
             cfg.stamp = v;
+        }
+        if let Some(v) = self.telemetry_format {
+            cfg.telemetry_format = v;
         }
         if let Some(v) = self.overload_fallback {
             cfg.overload_fallback = v;
@@ -331,6 +338,7 @@ struct TomlConfig {
     telemetry_interval_ms: Option<u64>,
     max_shift_px: Option<u32>,
     stamp: Option<String>,
+    telemetry_format: Option<String>,
     overload_fallback: Option<bool>,
     auto_adapt: Option<bool>,
     procamp: Option<TomlProcamp>,
@@ -390,6 +398,9 @@ impl TomlConfig {
         }
         if let Some(s) = self.stamp {
             o.stamp = Some(parse_stamp_mode(&s)?);
+        }
+        if let Some(s) = self.telemetry_format {
+            o.telemetry_format = Some(parse_telemetry_format(&s)?);
         }
         if let Some(p) = self.procamp {
             o.procamp = ProcampOverrides {
@@ -501,6 +512,24 @@ pub fn parse_stamp_mode(s: &str) -> Result<StampMode, String> {
     }
 }
 
+/// Telemetry output format (Issue #36): JSON Lines, or CSV with a
+/// fixed column schema shared by periodic, event and summary rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TelemetryFormat {
+    Json,
+    Csv,
+}
+
+pub fn parse_telemetry_format(s: &str) -> Result<TelemetryFormat, String> {
+    match s {
+        "json" => Ok(TelemetryFormat::Json),
+        "csv" => Ok(TelemetryFormat::Csv),
+        other => Err(format!(
+            "unknown telemetry_format '{other}' (expected: json | csv)"
+        )),
+    }
+}
+
 pub fn parse_signal_loss(s: &str) -> Result<SignalLossPolicy, String> {
     match s {
         "last-frame-hold" => Ok(SignalLossPolicy::LastFrameHold),
@@ -583,6 +612,9 @@ pub fn resolve(args: &Args) -> Result<CliConfig, String> {
     }
     if let Some(s) = &args.signal_loss {
         o.signal_loss = Some(parse_signal_loss(s)?);
+    }
+    if let Some(s) = &args.telemetry_format {
+        o.telemetry_format = Some(parse_telemetry_format(s)?);
     }
     o.apply_to(&mut cfg);
 
@@ -727,6 +759,7 @@ mod tests {
             config: config.map(str::to_string),
             stamp: None,
             signal_loss: None,
+            telemetry_format: None,
             no_overload_fallback: false,
             auto_adapt: false,
             max_frames: None,
@@ -803,6 +836,31 @@ mod tests {
             SignalLossPolicy::Passthrough
         );
         assert!(parse_signal_loss("freeze").is_err());
+    }
+
+    #[test]
+    fn telemetry_format_layers() {
+        let a = args(None, None);
+        assert_eq!(
+            resolve(&a).expect("resolve").telemetry_format,
+            TelemetryFormat::Json
+        );
+        let dir = std::env::temp_dir().join(format!("software-tbc-cli-tf-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("tbc.toml");
+        std::fs::write(&path, "telemetry_format = \"csv\"\n").expect("write toml");
+        let a = args(None, path.to_str());
+        assert_eq!(
+            resolve(&a).expect("resolve").telemetry_format,
+            TelemetryFormat::Csv
+        );
+        let mut a = args(None, path.to_str());
+        a.telemetry_format = Some("json".to_string());
+        assert_eq!(
+            resolve(&a).expect("resolve").telemetry_format,
+            TelemetryFormat::Json
+        );
+        assert!(parse_telemetry_format("yaml").is_err());
     }
 
     #[test]
