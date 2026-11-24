@@ -14,6 +14,13 @@ pub struct Telemetry {
     pub jitter_ms: f64,
     pub frames_in: u64,
     pub frames_out: u64,
+    /// Processing time per output frame, exponential moving average
+    /// (alpha 1/16), milliseconds (Issue #36).
+    pub proc_ms: f64,
+    /// Output frames whose processing time exceeded the frame
+    /// period (the deadline set with `set_deadline_ns`), cumulative
+    /// (Issue #36).
+    pub deadline_misses: u64,
 }
 
 /// Consumer of telemetry snapshots. The pipeline calls `report` at a
@@ -83,6 +90,14 @@ pub struct TelemetryCollector {
     latency_ms: f64,
     buffer_fill_ratio: f64,
     jitter: JitterEstimator,
+    // Processing-time statistics, integer nanoseconds (Issue #36).
+    proc_ema_ns: Option<u64>,
+    proc_window_max_ns: u64,
+    proc_max_ns: u64,
+    proc_total_ns: u128,
+    proc_samples: u64,
+    deadline_ns: Option<u64>,
+    deadline_misses: u64,
 }
 
 impl TelemetryCollector {
@@ -112,6 +127,58 @@ impl TelemetryCollector {
         self.buffer_fill_ratio = ratio.clamp(0.0, 1.0);
     }
 
+    /// Set the per-frame processing deadline (normally the target
+    /// frame interval) used for deadline-miss counting (Issue #36).
+    pub fn set_deadline_ns(&mut self, deadline_ns: u64) {
+        self.deadline_ns = Some(deadline_ns);
+    }
+
+    /// Record one output frame's processing time (Issue #36).
+    pub fn note_processing_time(&mut self, elapsed_ns: u64) {
+        match self.proc_ema_ns {
+            None => self.proc_ema_ns = Some(elapsed_ns),
+            Some(ema) => {
+                let next = (ema as i128 + (elapsed_ns as i128 - ema as i128) / 16).max(0);
+                self.proc_ema_ns = Some(next as u64);
+            }
+        }
+        self.proc_window_max_ns = self.proc_window_max_ns.max(elapsed_ns);
+        self.proc_max_ns = self.proc_max_ns.max(elapsed_ns);
+        self.proc_total_ns = self.proc_total_ns.saturating_add(elapsed_ns as u128);
+        self.proc_samples = self.proc_samples.saturating_add(1);
+        if let Some(deadline) = self.deadline_ns {
+            if elapsed_ns > deadline {
+                self.deadline_misses += 1;
+            }
+        }
+    }
+
+    /// The largest processing time since the last call, in
+    /// milliseconds; resets the window (Issue #36).
+    pub fn take_proc_window_max_ms(&mut self) -> f64 {
+        let max = self.proc_window_max_ns;
+        self.proc_window_max_ns = 0;
+        max as f64 / 1_000_000.0
+    }
+
+    /// Mean processing time over the whole run, milliseconds.
+    pub fn proc_avg_ms(&self) -> f64 {
+        if self.proc_samples == 0 {
+            return 0.0;
+        }
+        (self.proc_total_ns as f64 / self.proc_samples as f64) / 1_000_000.0
+    }
+
+    /// Largest processing time over the whole run, milliseconds.
+    pub fn proc_max_ms(&self) -> f64 {
+        self.proc_max_ns as f64 / 1_000_000.0
+    }
+
+    /// Number of processing-time samples recorded.
+    pub fn proc_samples(&self) -> u64 {
+        self.proc_samples
+    }
+
     pub fn snapshot(&self) -> Telemetry {
         Telemetry {
             latency_ms: self.latency_ms,
@@ -121,6 +188,8 @@ impl TelemetryCollector {
             jitter_ms: self.jitter.jitter_ms(),
             frames_in: self.frames_in,
             frames_out: self.frames_out,
+            proc_ms: self.proc_ema_ns.unwrap_or(0) as f64 / 1_000_000.0,
+            deadline_misses: self.deadline_misses,
         }
     }
 }
@@ -128,6 +197,47 @@ impl TelemetryCollector {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proc_time_ema_seeds_on_first_sample_and_tracks() {
+        let mut c = TelemetryCollector::new();
+        c.note_processing_time(16_000_000); // 16 ms seed
+        assert_eq!(c.snapshot().proc_ms, 16.0);
+        // Feeding 0 ms moves the EMA down by 1/16 of the gap per step.
+        c.note_processing_time(0);
+        assert_eq!(c.snapshot().proc_ms, 15.0);
+        for _ in 0..200 {
+            c.note_processing_time(0);
+        }
+        assert!(c.snapshot().proc_ms < 0.01);
+    }
+
+    #[test]
+    fn proc_time_window_max_resets_but_total_max_and_avg_persist() {
+        let mut c = TelemetryCollector::new();
+        c.note_processing_time(5_000_000);
+        c.note_processing_time(9_000_000);
+        assert_eq!(c.take_proc_window_max_ms(), 9.0);
+        // Window was reset by the take; the run max and mean persist.
+        c.note_processing_time(1_000_000);
+        assert_eq!(c.take_proc_window_max_ms(), 1.0);
+        assert_eq!(c.proc_max_ms(), 9.0);
+        assert_eq!(c.proc_samples(), 3);
+        assert_eq!(c.proc_avg_ms(), 5.0);
+    }
+
+    #[test]
+    fn deadline_misses_count_only_overruns() {
+        let mut c = TelemetryCollector::new();
+        c.note_processing_time(50_000_000); // no deadline set: no miss
+        assert_eq!(c.snapshot().deadline_misses, 0);
+        c.set_deadline_ns(33_366_666);
+        c.note_processing_time(10_000_000);
+        c.note_processing_time(33_366_666); // exactly at: not a miss
+        assert_eq!(c.snapshot().deadline_misses, 0);
+        c.note_processing_time(40_000_000);
+        assert_eq!(c.snapshot().deadline_misses, 1);
+    }
 
     #[test]
     fn constant_intervals_have_zero_jitter() {
