@@ -4,6 +4,7 @@
 //! according to a [`TbcConfig`] and reports [`Telemetry`] snapshots.
 //! See `SPEC.md` at the repository root for the full design.
 
+pub mod adapt;
 pub mod field;
 pub mod geometry;
 pub mod guard;
