@@ -65,6 +65,30 @@ pub struct Args {
     /// Head-switch concealment mode: replicate | interpolate.
     #[arg(long)]
     head_switch_mode: Option<String>,
+    /// Input frame width (default: the processing width).
+    #[arg(long)]
+    input_width: Option<u32>,
+    /// Input frame height (default: the processing height).
+    #[arg(long)]
+    input_height: Option<u32>,
+    /// Left edge of the processing window inside the input frame.
+    #[arg(long)]
+    crop_left: Option<u32>,
+    /// Top edge of the processing window inside the input frame.
+    #[arg(long)]
+    crop_top: Option<u32>,
+    /// Output frame width (default: the processing width).
+    #[arg(long)]
+    output_width: Option<u32>,
+    /// Output frame height (default: the processing height).
+    #[arg(long)]
+    output_height: Option<u32>,
+    /// Left position of the processed frame inside the output frame.
+    #[arg(long)]
+    pad_left: Option<u32>,
+    /// Top position of the processed frame inside the output frame.
+    #[arg(long)]
+    pad_top: Option<u32>,
     /// Named preset: vhs | svhs | unstable-composite | low-latency.
     #[arg(long)]
     preset: Option<String>,
@@ -266,8 +290,8 @@ impl OverloadController {
 
 fn open_source(cfg: &config::CliConfig) -> Result<Box<dyn FrameSource + Send>, IoError> {
     let geometry = RawGeometry {
-        width: cfg.core.width,
-        height: cfg.core.height,
+        width: cfg.input_width,
+        height: cfg.input_height,
         format: cfg.core.format,
     };
     if let Some((dir, pattern)) = split_sequence(&cfg.input) {
@@ -364,6 +388,29 @@ impl Pipeline {
                 self.output_error = true;
                 return false;
             }
+        };
+        // Pad to the output geometry (Issue #31).
+        let out = if cfg.pad_left > 0
+            || cfg.pad_top > 0
+            || cfg.output_width != cfg.core.width
+            || cfg.output_height != cfg.core.height
+        {
+            match tbc_core::geometry::pad_frame(
+                &out,
+                cfg.pad_left,
+                cfg.pad_top,
+                cfg.output_width,
+                cfg.output_height,
+            ) {
+                Ok(frame) => frame,
+                Err(e) => {
+                    eprintln!("software-tbc: output padding error: {e}");
+                    self.output_error = true;
+                    return false;
+                }
+            }
+        } else {
+            out
         };
         if let Err(e) = sink.write_frame(&out) {
             eprintln!("software-tbc: output error: {e}");
@@ -494,6 +541,14 @@ fn run(cfg: &config::CliConfig) -> i32 {
         let effective_order = Arc::clone(&effective_order);
         let auto_detect = cfg.field_order_auto;
         let rate = core.target_rate;
+        // Crop window (Issue #31): (left, top, processing width,
+        // processing height) when the input geometry differs from
+        // the processing geometry.
+        let crop = (cfg.input_width != core.width
+            || cfg.input_height != core.height
+            || cfg.crop_left != 0
+            || cfg.crop_top != 0)
+            .then_some((cfg.crop_left, cfg.crop_top, core.width, core.height));
         std::thread::spawn(move || {
             let mut detector = if auto_detect {
                 Some(FieldOrderDetector::new())
@@ -525,6 +580,19 @@ fn run(cfg: &config::CliConfig) -> i32 {
                         if frame.format.is_10bit() {
                             match frame.to_8bit() {
                                 Ok(converted) => frame = converted,
+                                Err(e) => {
+                                    *reader_error.lock().expect("error slot") =
+                                        Some(IoError::Core(e));
+                                    break 'read;
+                                }
+                            }
+                        }
+                        // Crop to the processing geometry
+                        // (Issue #31), before field-order detection
+                        // and stamping.
+                        if let Some((left, top, w, h)) = crop {
+                            match tbc_core::geometry::crop_frame(&frame, left, top, w, h) {
+                                Ok(cropped) => frame = cropped,
                                 Err(e) => {
                                     *reader_error.lock().expect("error slot") =
                                         Some(IoError::Core(e));
