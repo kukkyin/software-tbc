@@ -175,6 +175,17 @@ impl SyntheticSource {
             }
             return;
         }
+        if frame.format.is_10bit() {
+            // Jitter the 8-bit equivalent, then expand back
+            // (Issue #27).
+            if let Ok(mut converted) = frame.to_8bit() {
+                self.apply_jitter(&mut converted);
+                if let Ok(back) = VideoFrame::from_8bit(&converted, frame.format) {
+                    frame.data.copy_from_slice(&back.data);
+                }
+            }
+            return;
+        }
         // Advance the random walk by at most 1/4 px per line per frame.
         for walk in self.line_walk_q8.iter_mut() {
             *walk = (*walk + self.rng.next_i32(-64, 64)).clamp(-max_q8, max_q8);
@@ -249,6 +260,9 @@ impl SyntheticSource {
             // Uyvy is converted and handled before this match (see the
             // top of this function), so it never reaches here.
             PixelFormat::Uyvy => {}
+            // 10-bit formats are converted and handled before this
+            // match too (Issue #27).
+            PixelFormat::Yuv420p10 | PixelFormat::Yuv422p10 => {}
             PixelFormat::Rgb24 => {
                 let w = frame.width as usize;
                 for (line, &shift) in shifts.iter().enumerate() {
@@ -290,6 +304,17 @@ impl SyntheticSource {
         if shift == 0 {
             return;
         }
+        if frame.format.is_10bit() {
+            // Shift the 8-bit equivalent, then expand back
+            // (Issue #27).
+            if let Ok(mut converted) = frame.to_8bit() {
+                self.apply_pedestal(&mut converted);
+                if let Ok(back) = VideoFrame::from_8bit(&converted, frame.format) {
+                    frame.data.copy_from_slice(&back.data);
+                }
+            }
+            return;
+        }
         let adjust = |v: u8| -> u8 { (v as i16 + shift).clamp(0, 255) as u8 };
         match frame.format {
             PixelFormat::Yuv422p | PixelFormat::Yuyv => {
@@ -315,6 +340,9 @@ impl SyntheticSource {
                     *b = adjust(*b);
                 }
             }
+            // 10-bit formats are converted and handled before this
+            // match (see the top of this function).
+            PixelFormat::Yuv420p10 | PixelFormat::Yuv422p10 => {}
         }
     }
 }
