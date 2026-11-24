@@ -36,7 +36,7 @@ fn extract_luma(frame: &VideoFrame, out: &mut Vec<u8>) -> bool {
     out.clear();
     out.resize(w * h, 0);
     match frame.format {
-        PixelFormat::Yuv420p => {
+        PixelFormat::Yuv420p | PixelFormat::Nv12 => {
             out.copy_from_slice(&frame.data[..w * h]);
         }
         PixelFormat::Yuv422p | PixelFormat::Yuyv => {
@@ -92,7 +92,7 @@ pub(crate) fn luma_row(frame: &VideoFrame, line: u32) -> Option<Vec<u8>> {
     let w = frame.width as usize;
     let l = line as usize;
     let row = match frame.format {
-        PixelFormat::Yuv420p => {
+        PixelFormat::Yuv420p | PixelFormat::Nv12 => {
             let start = l * w;
             frame.data.get(start..start + w)?.to_vec()
         }
