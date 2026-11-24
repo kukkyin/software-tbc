@@ -209,6 +209,18 @@ VHS 等でフレーム下部に現れるヘッドスイッチングノイズを�
 - 420 では色差平面の下部 ceil(N/2) ラインも同様に隠蔽する。10bit 形式は
   境界変換後の 8bit フレームに対して適用される。
 
+### 4.8 幾何変換（`geometry.rs`）
+
+入力・処理・出力の幾何を分離する（Issue #31）。処理寸法は従来どおり
+`width`/`height`（有効領域）。入力寸法 `input_width`/`input_height`（未指定なら
+処理寸法）でソースを読み、リーダーで境界変換の直後に
+`crop_left`/`crop_top` を原点とする処理ウィンドウを切り出す。以降のパイプラインは
+処理幾何しか見ない。出力は `output_width`/`output_height`（未指定なら処理寸法）の
+黒キャンバスへ `pad_left`/`pad_top` の位置に処理済みフレームを置く（emit 時、
+ワイヤ形式変換の直後）。制約: 両ウィンドウが相手の幾何に収まること。オフセットは
+色差のサブサンプリングに合わせ、4:2:0 では両方向とも偶数、4:2:2 系では left が
+偶数（RGB は無制約）。違反は設定エラー（終了コード 2）。
+
 ## 5. メモリ・パフォーマンス設計
 
 - **事前確保**: 起動時に `buffer_frames + 2` 枚分のフレームバッファをプールとして確保し、
@@ -246,7 +258,9 @@ CLI（`tbc-cli`、バイナリ名 `software-tbc`）:
 - 引数: `--input`（`-`=stdin）、`--output`（`-`=stdout）、`--width/--height/--format`、
   `--preset`、`--config`（TOML）、`--stamp nominal|wall-clock`、`--standard ntsc|pal|1080i`、
   `--field-order progressive|top-first|bottom-first|auto`、
-  `--head-switch-lines N`、`--head-switch-mode replicate|interpolate`。
+  `--head-switch-lines N`、`--head-switch-mode replicate|interpolate`、
+  幾何分離（§4.8）: `--input-width/--input-height`、`--crop-left/--crop-top`、
+  `--output-width/--output-height`、`--pad-left/--pad-top`。
   優先順位: CLI引数 > 設定ファイル > プリセット > 既定値。
 - `--standard` は規格プリセット（Issue #25）: 幾何・目標レート・フィールド順序を一括指定する。
   ntsc = 720×480, 30000/1001, bottom-first / pal = 720×576, 25/1, top-first /
@@ -293,6 +307,14 @@ TOML 形式。`TbcConfig`（§3）＋CLI節をシリアライズしたもの。
 ```toml
 width = 720
 height = 480
+input_width = 720               # 入力寸法（省略時 = 処理寸法、§4.8）
+input_height = 486
+crop_left = 0
+crop_top = 6
+output_width = 720              # 出力寸法（省略時 = 処理寸法、§4.8）
+output_height = 480
+pad_left = 0
+pad_top = 0
 format = "yuv422p"              # yuv420p | yuv422p | rgb24 | uyvy | yuyv | yuv420p10le | yuv422p10le
 field_order = "bottom-first"    # progressive | top-first | bottom-first | auto（自動判定、§4.3）
 target_rate = "30000/1001"      # 有理数文字列
