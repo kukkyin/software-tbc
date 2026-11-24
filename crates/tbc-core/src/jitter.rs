@@ -39,12 +39,21 @@ fn extract_luma(frame: &VideoFrame, out: &mut Vec<u8>) -> bool {
         PixelFormat::Yuv420p => {
             out.copy_from_slice(&frame.data[..w * h]);
         }
-        PixelFormat::Yuv422p => {
+        PixelFormat::Yuv422p | PixelFormat::Yuyv => {
             for l in 0..h {
                 let src = &frame.data[l * w * 2..(l + 1) * w * 2];
                 let dst = &mut out[l * w..(l + 1) * w];
                 for x in 0..w {
                     dst[x] = src[x * 2];
+                }
+            }
+        }
+        PixelFormat::Uyvy => {
+            for l in 0..h {
+                let src = &frame.data[l * w * 2..(l + 1) * w * 2];
+                let dst = &mut out[l * w..(l + 1) * w];
+                for x in 0..w {
+                    dst[x] = src[x * 2 + 1];
                 }
             }
         }
@@ -80,10 +89,15 @@ pub(crate) fn luma_row(frame: &VideoFrame, line: u32) -> Option<Vec<u8>> {
             let start = l * w;
             frame.data.get(start..start + w)?.to_vec()
         }
-        PixelFormat::Yuv422p => {
+        PixelFormat::Yuv422p | PixelFormat::Yuyv => {
             let start = l * w * 2;
             let line_data = frame.data.get(start..start + w * 2)?;
             (0..w).map(|x| line_data[x * 2]).collect()
+        }
+        PixelFormat::Uyvy => {
+            let start = l * w * 2;
+            let line_data = frame.data.get(start..start + w * 2)?;
+            (0..w).map(|x| line_data[x * 2 + 1]).collect()
         }
         PixelFormat::Rgb24 => {
             let start = l * w * 3;
