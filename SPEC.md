@@ -26,7 +26,8 @@
 前提:
 
 - 扱う信号は RAW フレーム列（ヘッダなし）。解像度・ピクセルフォーマット・フレームレートは外部から与えられる。
-- 対応フォーマットは `yuv420p` / `yuv422p` / `rgb24`（8bit）。10bitやパックドYUYVは将来拡張（§10）。
+- 対応フォーマットは `yuv420p` / `yuv422p` / `rgb24`（8bit）に加え、パックド 4:2:2 の
+  `uyvy` / `yuyv` を境界変換で対応する（Issue #23、§3）。10bit は将来拡張（§10）。
 - インターレースは 480i/576i を主対象とし、フィールドオーダーを保持したまま処理する。
 
 ## 2. ワークスペース構成
@@ -60,7 +61,7 @@ software-tbc/
 正の定義は `crates/tbc-core/src/lib.rs`。要点:
 
 ```rust
-pub enum PixelFormat { Yuv420p, Yuv422p, Rgb24 }        // frame_size(w,h) を提供
+pub enum PixelFormat { Yuv420p, Yuv422p, Rgb24, Uyvy, Yuyv }  // frame_size(w,h) を提供
 pub struct FrameRate { pub num: u32, pub den: u32 }     // 有理数。29.97 = 30000/1001
 pub enum FieldOrder { Progressive, TopFieldFirst, BottomFieldFirst }
 pub struct VideoFrame {
@@ -73,6 +74,11 @@ pub struct VideoFrame {
 }
 pub enum TbcError { FrameSizeMismatch{..}, InvalidConfig(String), SignalLost }
 ```
+
+注記（Issue #23）: パイプライン内部の `Yuv422p` 表現は Y0 Cb Y1 Cr のパックド
+バイト順であり、平面配置ではない。`Uyvy` / `Yuyv` は入出力境界でのみ現れる形式で、
+`VideoFrame::to_yuv422p` / `from_yuv422p` により内部表現と可逆変換する
+（4:2:2 同士のためバイト並べ替えのみでビット完全）。パックド形式は偶数幅必須。
 
 エラー方針:
 
@@ -245,7 +251,7 @@ TOML 形式。`TbcConfig`（§3）＋CLI節をシリアライズしたもの。
 ```toml
 width = 720
 height = 480
-format = "yuv422p"              # yuv420p | yuv422p | rgb24
+format = "yuv422p"              # yuv420p | yuv422p | rgb24 | uyvy | yuyv
 field_order = "bottom-first"    # progressive | top-first | bottom-first
 target_rate = "30000/1001"      # 有理数文字列
 rate_policy = "hold-drop"       # hold-drop | blend | motion-interpolate
@@ -303,7 +309,7 @@ gamma = 1.0
 
 ## 10. 範囲外・将来拡張
 
-- 10bit / HDR、YUYV パックド形式、BT.709/2020
+- 10bit / HDR、BT.709/2020
 - 高品質デインターレース（Yadif相当）、モーション補間（光フロー）
 - 音声の同期・リサンプル（映像のみ扱う。音声は FFmpeg 側で遅延調整する前提）
 - GUI プレビュー（トレイト経由の別クレートで対応可能な設計にはする）
