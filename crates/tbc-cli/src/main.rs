@@ -19,7 +19,7 @@ use tbc_core::adapt::{JitterAdapter, RangeClass, RangeEstimator};
 use tbc_core::field::FieldOrderDetector;
 use tbc_core::guard::{GuardEvent, SignalGuard};
 use tbc_core::head_switch::apply_head_switch;
-use tbc_core::jitter::{apply_shifts, JitterDetector};
+use tbc_core::jitter::{apply_shifts, JitterDetector, LineShift};
 use tbc_core::procamp::ProcAmp;
 use tbc_core::sync::ring::RingBuffer;
 use tbc_core::sync::FrameSynchronizer;
@@ -123,6 +123,11 @@ pub struct Args {
     /// adapt the jitter search range to the source at runtime.
     #[arg(long)]
     auto_adapt: bool,
+    /// Analyze only: run the pipeline, write no output (the output
+    /// path is never opened), and print a JSON analysis report to
+    /// stdout. Exit code 4 if the stream ends without a signal.
+    #[arg(long)]
+    analyze_only: bool,
     /// Stop after emitting this many output frames.
     #[arg(long)]
     max_frames: Option<u64>,
@@ -389,6 +394,79 @@ struct Pipeline {
     signal_loss_events: u64,
     lost_since: Option<Instant>,
     signal_lost_ms_total: u64,
+    /// Analysis statistics (Issue #37); `Some` only in analyze-only
+    /// mode, where the pipeline runs against a discarding sink.
+    analyze: Option<AnalyzeStats>,
+}
+
+/// Statistics for analyze-only mode (Issue #37). Fixed-size
+/// counters only; per-frame work is a handful of integer updates
+/// plus the range estimator's own luma scan (shared with
+/// auto-adapt, never a second scan of the frame).
+#[derive(Default)]
+struct AnalyzeStats {
+    /// Observer instance of the core range estimator: the report's
+    /// classification and luma range are exactly what auto-adapt
+    /// would see, with no analysis-only thresholds.
+    range: RangeEstimator,
+    /// Jitter line-shift samples actually estimated. Frames whose
+    /// estimate did not run (signal-loss bypass, no estimate) never
+    /// enter the sums, so the means describe estimated frames only.
+    jitter_samples: u64,
+    jitter_frames: u64,
+    jitter_sum_abs_q8: u128,
+    jitter_sum_signed_q8: i128,
+    jitter_max_abs_q8: u32,
+    jitter_unestimated_frames: u64,
+    bypassed_frames: u64,
+}
+
+impl AnalyzeStats {
+    fn observe(&mut self, frame: &VideoFrame) {
+        self.range.observe(frame);
+    }
+
+    fn note_shifts(&mut self, shifts: &[LineShift]) {
+        self.jitter_frames += 1;
+        for s in shifts {
+            self.jitter_samples += 1;
+            self.jitter_sum_abs_q8 += s.shift_q8.unsigned_abs() as u128;
+            self.jitter_sum_signed_q8 += s.shift_q8 as i128;
+            self.jitter_max_abs_q8 = self.jitter_max_abs_q8.max(s.shift_q8.unsigned_abs());
+        }
+    }
+
+    /// Mean absolute shift in pixels, or `None` with no samples.
+    fn jitter_mean_abs_px(&self) -> Option<f64> {
+        (self.jitter_samples > 0)
+            .then(|| self.jitter_sum_abs_q8 as f64 / self.jitter_samples as f64 / 256.0)
+    }
+
+    /// Mean signed shift in pixels (a directional bias), or `None`.
+    fn jitter_mean_signed_px(&self) -> Option<f64> {
+        (self.jitter_samples > 0)
+            .then(|| self.jitter_sum_signed_q8 as f64 / self.jitter_samples as f64 / 256.0)
+    }
+
+    /// Largest absolute shift in pixels, or `None` with no samples.
+    fn jitter_max_abs_px(&self) -> Option<f64> {
+        (self.jitter_samples > 0).then(|| self.jitter_max_abs_q8 as f64 / 256.0)
+    }
+}
+
+/// A sink that discards every frame (Issue #37). Analyze-only mode
+/// runs the full pipeline against it; the configured output path is
+/// never opened, created or truncated.
+struct NullSink;
+
+impl FrameSink for NullSink {
+    fn write_frame(&mut self, _frame: &VideoFrame) -> Result<(), IoError> {
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<(), IoError> {
+        Ok(())
+    }
 }
 
 impl Pipeline {
@@ -485,11 +563,19 @@ impl Pipeline {
                 // apply, and no frame is fabricated: when the
                 // synchronizer returns nothing, nothing is emitted.
                 if self.guard.is_lost() {
+                    if let Some(a) = self.analyze.as_mut() {
+                        a.bypassed_frames += 1;
+                    }
                     return self.emit(cfg, sink, out);
                 }
                 // Conceal head-switching noise before jitter
                 // estimation sees the frame (Issue #29).
                 apply_head_switch(&mut out, &cfg.core.head_switch);
+                // Analyze-only (Issue #37): the observer estimator
+                // sees the same synced frame auto-adapt would see.
+                if let Some(a) = self.analyze.as_mut() {
+                    a.observe(&out);
+                }
                 // Auto-adapt (Issue #32): the range estimator sees
                 // the synced frame before any level processing; a
                 // locked reclassification rebuilds the proc-amp.
@@ -510,7 +596,14 @@ impl Pipeline {
                 }
                 if !self.controller.skip_jitter() {
                     if let Some(det) = self.detector.as_mut() {
-                        if let Some(shifts) = det.estimate(&out) {
+                        let estimated = det.estimate(&out);
+                        if let Some(a) = self.analyze.as_mut() {
+                            match &estimated {
+                                Some(shifts) => a.note_shifts(shifts),
+                                None => a.jitter_unestimated_frames += 1,
+                            }
+                        }
+                        if let Some(shifts) = estimated {
                             let _ = apply_shifts(&mut out, &shifts);
                             // Auto-adapt (Issue #32): follow the
                             // observed jitter with the search range.
@@ -588,6 +681,12 @@ impl Pipeline {
                 "signal_recovered"
             }
         };
+        // Analyze-only mode keeps stdout as its only output and
+        // prints no telemetry rows; the bookkeeping above still
+        // feeds the final report (Issue #37).
+        if cfg.analyze_only {
+            return;
+        }
         let t = self.collector.snapshot();
         let line = match cfg.telemetry_format {
             config::TelemetryFormat::Json => format_event_json(
@@ -634,6 +733,79 @@ impl Pipeline {
             config::TelemetryFormat::Csv => format_summary_csv(&row),
         };
         eprintln!("{line}");
+    }
+
+    /// Whether a signal is present at the end of the run: at least
+    /// one frame arrived and the guard is not in a loss state.
+    fn signal_present(&self) -> bool {
+        self.collector.snapshot().frames_in > 0 && !self.guard.is_lost()
+    }
+
+    /// Build the analyze-only report (Issue #37). Printed to stdout
+    /// by the caller; every other run output stays on stderr.
+    fn report_analysis(&self, cfg: &config::CliConfig, runtime: Duration) -> String {
+        let t = self.collector.snapshot();
+        let mut lost_ms = self.signal_lost_ms_total;
+        if let Some(since) = self.lost_since {
+            lost_ms += since.elapsed().as_millis() as u64;
+        }
+        let a = self.analyze.as_ref();
+        let (luma_min, luma_max, range_class) = match a.and_then(|a| a.range.observed_range()) {
+            Some((mn, mx)) => (
+                mn.to_string(),
+                mx.to_string(),
+                match a.map(|a| a.range.class()) {
+                    Some(RangeClass::Full) => "full",
+                    _ => "limited",
+                },
+            ),
+            None => ("null".to_string(), "null".to_string(), "unknown"),
+        };
+        let opt_px = |v: Option<f64>| match v {
+            Some(x) => format!("{x:.3}"),
+            None => "null".to_string(),
+        };
+        format!(
+            "{{\"type\":\"analysis\",\"width\":{},\"height\":{},\"format\":\"{}\",\"runtime_s\":{:.3},\"frames_in\":{},\"frames_out\":{},\"dropped_frames\":{},\"duplicated_frames\":{},\"signal_present\":{},\"signal_loss_events\":{},\"signal_lost_ms\":{},\"drift_ppm\":{},\"drift_valid\":{},\"jitter_samples\":{},\"jitter_frames\":{},\"jitter_unestimated_frames\":{},\"jitter_bypassed_frames\":{},\"jitter_mean_abs_px\":{},\"jitter_mean_signed_px\":{},\"jitter_max_abs_px\":{},\"luma_min\":{},\"luma_max\":{},\"range_class\":\"{}\"}}",
+            cfg.core.width,
+            cfg.core.height,
+            wire_format_name(cfg.core.format),
+            runtime.as_secs_f64(),
+            t.frames_in,
+            self.frames_out,
+            self.sync.dropped_frames(),
+            self.sync.duplicated_frames(),
+            self.signal_present(),
+            self.signal_loss_events,
+            lost_ms,
+            self.sync.drift_ppm_estimate(),
+            self.signal_present(),
+            a.map_or(0, |a| a.jitter_samples),
+            a.map_or(0, |a| a.jitter_frames),
+            a.map_or(0, |a| a.jitter_unestimated_frames),
+            a.map_or(0, |a| a.bypassed_frames),
+            opt_px(a.and_then(|a| a.jitter_mean_abs_px())),
+            opt_px(a.and_then(|a| a.jitter_mean_signed_px())),
+            opt_px(a.and_then(|a| a.jitter_max_abs_px())),
+            luma_min,
+            luma_max,
+            range_class,
+        )
+    }
+}
+
+/// The `--format` spelling of a wire format, for the analysis
+/// report (Issue #37).
+fn wire_format_name(format: PixelFormat) -> &'static str {
+    match format {
+        PixelFormat::Yuv420p => "yuv420p",
+        PixelFormat::Yuv422p => "yuv422p",
+        PixelFormat::Rgb24 => "rgb24",
+        PixelFormat::Uyvy => "uyvy",
+        PixelFormat::Yuyv => "yuyv",
+        PixelFormat::Yuv420p10 => "yuv420p10le",
+        PixelFormat::Yuv422p10 => "yuv422p10le",
+        PixelFormat::Nv12 => "nv12",
     }
 }
 
@@ -844,11 +1016,17 @@ fn run(cfg: &config::CliConfig) -> i32 {
             return 3;
         }
     };
-    let mut sink = match open_sink(cfg) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("software-tbc: output error: {e}");
-            return 3;
+    // Analyze-only mode never opens the output path (Issue #37):
+    // the pipeline runs against a sink that discards every frame.
+    let mut sink: Box<dyn FrameSink + Send> = if cfg.analyze_only {
+        Box::new(NullSink)
+    } else {
+        match open_sink(cfg) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("software-tbc: output error: {e}");
+                return 3;
+            }
         }
     };
 
@@ -1007,6 +1185,7 @@ fn run(cfg: &config::CliConfig) -> i32 {
             ((core.target_rate.den as u128 * 1_000_000_000) / core.target_rate.num as u128) as u64,
         ),
         auto_order: cfg.field_order_auto.then(|| Arc::clone(&effective_order)),
+        analyze: cfg.analyze_only.then(AnalyzeStats::default),
         range_estimator: cfg.auto_adapt.then(RangeEstimator::new),
         jitter_adapter: (cfg.auto_adapt && core.jitter_correction)
             .then(|| JitterAdapter::new(cfg.max_shift_px)),
@@ -1028,7 +1207,7 @@ fn run(cfg: &config::CliConfig) -> i32 {
         ((core.target_rate.den as u128 * 1_000_000_000) / core.target_rate.num as u128) as u64,
     );
     let run_started = Instant::now();
-    if cfg.telemetry_format == config::TelemetryFormat::Csv {
+    if cfg.telemetry_format == config::TelemetryFormat::Csv && !cfg.analyze_only {
         eprintln!("{}", csv_header());
     }
     let mut last_ingest_seq: Option<u64> = None;
@@ -1087,7 +1266,8 @@ fn run(cfg: &config::CliConfig) -> i32 {
                 std::thread::yield_now();
             }
         }
-        if cfg.telemetry_interval_ms > 0
+        if !cfg.analyze_only
+            && cfg.telemetry_interval_ms > 0
             && last_telemetry.elapsed().as_millis() >= cfg.telemetry_interval_ms as u128
         {
             pipe.report_telemetry(cfg, &ring, run_started.elapsed());
@@ -1129,6 +1309,16 @@ fn run(cfg: &config::CliConfig) -> i32 {
     } else {
         0
     };
+    if cfg.analyze_only {
+        // The analysis report is the run's only stdout output
+        // (Issue #37). Exit 4 when the stream ended without a
+        // signal, unless an I/O error already decided the code.
+        println!("{}", pipe.report_analysis(cfg, run_started.elapsed()));
+        if code == 0 && !pipe.signal_present() {
+            return 4;
+        }
+        return code;
+    }
     // End-of-run summary, exactly once on every normal exit path
     // (Issue #36).
     pipe.report_summary(cfg, run_started.elapsed());
@@ -1420,6 +1610,7 @@ mod tests {
             signal_loss_events: 0,
             lost_since: None,
             signal_lost_ms_total: 0,
+            analyze: None,
         }
     }
 
@@ -1544,6 +1735,45 @@ mod tests {
         assert!(rows[0].starts_with("periodic,"));
         assert!(rows[1].starts_with("event,"));
         assert!(rows[2].starts_with("summary,"));
+    }
+
+    #[test]
+    fn analyze_stats_accumulate_only_estimated_samples() {
+        let mut a = AnalyzeStats::default();
+        assert!(a.jitter_mean_abs_px().is_none());
+        assert!(a.jitter_max_abs_px().is_none());
+        assert_eq!(a.range.observed_range(), None);
+        a.observe(&frame_4x2());
+        assert!(a.range.observed_range().is_some());
+        a.note_shifts(&[
+            LineShift {
+                line: 0,
+                shift_q8: 256,
+            },
+            LineShift {
+                line: 1,
+                shift_q8: -128,
+            },
+        ]);
+        assert_eq!(a.jitter_samples, 2);
+        assert_eq!(a.jitter_frames, 1);
+        assert_eq!(a.jitter_mean_abs_px(), Some(0.75));
+        assert_eq!(a.jitter_mean_signed_px(), Some(0.25));
+        assert_eq!(a.jitter_max_abs_px(), Some(1.0));
+    }
+
+    #[test]
+    fn analysis_report_shape_and_null_statistics() {
+        let cfg = config::CliConfig::default();
+        let mut pipe = passthrough_pipeline(&cfg);
+        pipe.analyze = Some(AnalyzeStats::default());
+        let report = pipe.report_analysis(&cfg, Duration::from_secs(1));
+        assert!(report.starts_with("{\"type\":\"analysis\""), "{report}");
+        assert!(report.contains("\"signal_present\":false"), "{report}");
+        assert!(report.contains("\"jitter_mean_abs_px\":null"), "{report}");
+        assert!(report.contains("\"luma_min\":null"), "{report}");
+        assert!(report.contains("\"range_class\":\"unknown\""), "{report}");
+        assert!(report.contains("\"format\":\"yuv422p\""), "{report}");
     }
 
     #[test]
