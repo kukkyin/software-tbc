@@ -228,11 +228,15 @@ impl FieldOrderDetector {
 /// Returns a progressive frame of the same height, or `None` when the
 /// frame layout cannot be split into fields this way.
 pub fn bob_field(frame: &VideoFrame, top_field: bool) -> Option<VideoFrame> {
-    if frame.height < 2 || frame.format == PixelFormat::Yuv420p || frame.format.is_10bit() {
-        // Yuv420p chroma is shared between line pairs; a naive per-line
-        // split would corrupt it. 10-bit frames store u16 samples, so
-        // the byte-wise line work below does not apply either. Both
-        // are left for a later, format-aware pass.
+    if frame.height < 2
+        || frame.format == PixelFormat::Yuv420p
+        || frame.format == PixelFormat::Nv12
+        || frame.format.is_10bit()
+    {
+        // Yuv420p/Nv12 chroma is shared between line pairs; a naive
+        // per-line split would corrupt it. 10-bit frames store u16
+        // samples, so the byte-wise line work below does not apply
+        // either. Both are left for a later, format-aware pass.
         return None;
     }
     let first = if top_field { 0 } else { 1 };
