@@ -57,6 +57,10 @@ pub enum PixelFormat {
     /// converted to `Yuv422p` for processing (Issue #27). Unlike the
     /// pipeline's packed `Yuv422p`, this layout really is planar.
     Yuv422p10,
+    /// Semi-planar YUV 4:2:0, 8-bit (FFmpeg `nv12`): a Y plane
+    /// followed by one interleaved Cb/Cr plane. Boundary format:
+    /// converted to `Yuv420p` for processing (Issue #33).
+    Nv12,
 }
 
 impl PixelFormat {
@@ -64,7 +68,7 @@ impl PixelFormat {
     pub fn frame_size(self, width: u32, height: u32) -> usize {
         let px = (width * height) as usize;
         match self {
-            PixelFormat::Yuv420p => px * 3 / 2,
+            PixelFormat::Yuv420p | PixelFormat::Nv12 => px * 3 / 2,
             PixelFormat::Yuv422p | PixelFormat::Uyvy | PixelFormat::Yuyv => px * 2,
             PixelFormat::Rgb24 => px * 3,
             PixelFormat::Yuv420p10 => px * 3,
@@ -220,6 +224,74 @@ impl VideoFrame {
             }
             other => Err(TbcError::InvalidConfig(format!(
                 "cannot convert yuv422p to {other:?}"
+            ))),
+        }
+    }
+
+    /// Convert an `Nv12` frame into the pipeline's `Yuv420p`
+    /// representation (Issue #33): the Y plane carries over and the
+    /// interleaved Cb/Cr plane is deinterleaved into separate
+    /// planes. A `Yuv420p` frame converts to a copy of itself; any
+    /// other format is an error. Exactly reversible by
+    /// [`VideoFrame::from_yuv420p`].
+    pub fn to_yuv420p(&self) -> Result<VideoFrame, TbcError> {
+        self.validate()?;
+        match self.format {
+            PixelFormat::Yuv420p => Ok(self.clone()),
+            PixelFormat::Nv12 => {
+                let px = (self.width * self.height) as usize;
+                let (y_plane, uv_plane) = self.data.split_at(px);
+                let mut data = Vec::with_capacity(px * 3 / 2);
+                data.extend_from_slice(y_plane);
+                let mut cb = Vec::with_capacity(px / 4);
+                let mut cr = Vec::with_capacity(px / 4);
+                for pair in uv_plane.chunks_exact(2) {
+                    cb.push(pair[0]);
+                    cr.push(pair[1]);
+                }
+                data.extend_from_slice(&cb);
+                data.extend_from_slice(&cr);
+                let mut out = self.clone();
+                out.format = PixelFormat::Yuv420p;
+                out.data = data;
+                Ok(out)
+            }
+            other => Err(TbcError::InvalidConfig(format!(
+                "cannot convert {other:?} to yuv420p"
+            ))),
+        }
+    }
+
+    /// Inverse of [`VideoFrame::to_yuv420p`]: interleave a
+    /// `Yuv420p` frame's chroma planes into `Nv12` (a `Yuv420p`
+    /// target returns a copy). Any other combination is an error.
+    pub fn from_yuv420p(frame: &VideoFrame, format: PixelFormat) -> Result<VideoFrame, TbcError> {
+        if frame.format != PixelFormat::Yuv420p {
+            return Err(TbcError::InvalidConfig(format!(
+                "from_yuv420p needs a yuv420p source, got {:?}",
+                frame.format
+            )));
+        }
+        frame.validate()?;
+        match format {
+            PixelFormat::Yuv420p => Ok(frame.clone()),
+            PixelFormat::Nv12 => {
+                let px = (frame.width * frame.height) as usize;
+                let (y_plane, rest) = frame.data.split_at(px);
+                let (cb_plane, cr_plane) = rest.split_at(px / 4);
+                let mut data = Vec::with_capacity(px * 3 / 2);
+                data.extend_from_slice(y_plane);
+                for i in 0..px / 4 {
+                    data.push(cb_plane[i]);
+                    data.push(cr_plane[i]);
+                }
+                let mut out = frame.clone();
+                out.format = PixelFormat::Nv12;
+                out.data = data;
+                Ok(out)
+            }
+            other => Err(TbcError::InvalidConfig(format!(
+                "cannot convert yuv420p to {other:?}"
             ))),
         }
     }
@@ -402,8 +474,10 @@ impl TbcConfig {
                 "width and height must be non-zero".into(),
             ));
         }
-        if matches!(self.format, PixelFormat::Yuv420p | PixelFormat::Yuv420p10)
-            && (self.width % 2 == 1 || self.height % 2 == 1)
+        if matches!(
+            self.format,
+            PixelFormat::Yuv420p | PixelFormat::Yuv420p10 | PixelFormat::Nv12
+        ) && (self.width % 2 == 1 || self.height % 2 == 1)
         {
             return Err(TbcError::InvalidConfig(
                 "yuv420 formats require even width and height".into(),
@@ -610,6 +684,31 @@ mod tests {
         let back = VideoFrame::from_yuv422p(&converted, PixelFormat::Uyvy).expect("re-pack");
         assert_eq!(back.format, PixelFormat::Uyvy);
         assert_eq!(back.data, uyvy.data);
+    }
+
+    #[test]
+    fn nv12_conversion_deinterleaves_chroma() {
+        // 4x2: Y = 1..=8, interleaved UV = [101, 201, 102, 202]
+        // (Cb = 101, 102; Cr = 201, 202).
+        let nv12 = frame_with(
+            PixelFormat::Nv12,
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 101, 201, 102, 202],
+            4,
+            2,
+        );
+        let converted = nv12.to_yuv420p().expect("convert");
+        assert_eq!(converted.format, PixelFormat::Yuv420p);
+        assert_eq!(
+            converted.data,
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 101, 102, 201, 202]
+        );
+        // And back, byte for byte.
+        let back = VideoFrame::from_yuv420p(&converted, PixelFormat::Nv12).expect("interleave");
+        assert_eq!(back.format, PixelFormat::Nv12);
+        assert_eq!(back.data, nv12.data);
+        // Wrong directions are errors.
+        assert!(nv12.to_yuv422p().is_err());
+        assert!(VideoFrame::from_yuv420p(&nv12, PixelFormat::Nv12).is_err());
     }
 
     #[test]
