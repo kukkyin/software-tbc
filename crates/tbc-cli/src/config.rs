@@ -408,6 +408,7 @@ impl TomlConfig {
 pub fn parse_format(s: &str) -> Result<PixelFormat, String> {
     match s {
         "yuv420p" => Ok(PixelFormat::Yuv420p),
+        "nv12" => Ok(PixelFormat::Nv12),
         "yuv422p" => Ok(PixelFormat::Yuv422p),
         "rgb24" => Ok(PixelFormat::Rgb24),
         "uyvy" => Ok(PixelFormat::Uyvy),
@@ -623,7 +624,9 @@ fn validate_geometry(cfg: &CliConfig) -> Result<(), String> {
     // Even-dimension rules for a frame size in this format.
     let check_size = |w: u32, h: u32, what: &str| -> Result<(), String> {
         match cfg.core.format {
-            PixelFormat::Yuv420p | PixelFormat::Yuv420p10 if w % 2 == 1 || h % 2 == 1 => {
+            PixelFormat::Yuv420p | PixelFormat::Yuv420p10 | PixelFormat::Nv12
+                if w % 2 == 1 || h % 2 == 1 =>
+            {
                 Err(invalid(format!(
                     "{what} {w}x{h} must be even in both dimensions for 4:2:0"
                 )))
@@ -642,7 +645,9 @@ fn validate_geometry(cfg: &CliConfig) -> Result<(), String> {
     // packed/4:2:2 family horizontally only, RGB not at all.
     let check_offsets = |left: u32, top: u32, what: &str| -> Result<(), String> {
         match cfg.core.format {
-            PixelFormat::Yuv420p | PixelFormat::Yuv420p10 if left % 2 == 1 || top % 2 == 1 => {
+            PixelFormat::Yuv420p | PixelFormat::Yuv420p10 | PixelFormat::Nv12
+                if left % 2 == 1 || top % 2 == 1 =>
+            {
                 Err(invalid(format!(
                     "{what} offsets {left},{top} must be even for 4:2:0"
                 )))
@@ -743,6 +748,17 @@ mod tests {
     #[test]
     fn unknown_preset_is_an_error() {
         assert!(resolve(&args(Some("betamax"), None)).is_err());
+    }
+
+    #[test]
+    fn nv12_format_parses_and_validates_like_420() {
+        let mut a = args(None, None);
+        a.format = Some("nv12".to_string());
+        let cfg = resolve(&a).expect("resolve");
+        assert_eq!(cfg.core.format, PixelFormat::Nv12);
+        // Odd processing height is rejected for the 4:2:0 class.
+        a.height = Some(479);
+        assert!(resolve(&a).is_err());
     }
 
     #[test]
@@ -1055,7 +1071,8 @@ mod tests {
             parse_format("yuv422p10le").expect("422p10"),
             PixelFormat::Yuv422p10
         );
-        assert!(parse_format("nv12").is_err());
+        assert_eq!(parse_format("nv12").expect("nv12"), PixelFormat::Nv12);
+        assert!(parse_format("nv21").is_err());
 
         // A packed format resolves end to end and validates at even width.
         let mut a = args(None, None);
