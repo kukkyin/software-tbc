@@ -19,6 +19,9 @@ enum Layout {
     Planar420(usize),
     /// Planar 4:2:2; the value is bytes per sample (2).
     Planar422(usize),
+    /// Semi-planar 4:2:0 (NV12): a Y plane plus one interleaved
+    /// Cb/Cr plane whose rows are as wide as the luma rows.
+    SemiPlanar420,
 }
 
 fn layout(format: PixelFormat) -> Layout {
@@ -28,6 +31,7 @@ fn layout(format: PixelFormat) -> Layout {
         PixelFormat::Yuv420p => Layout::Planar420(1),
         PixelFormat::Yuv420p10 => Layout::Planar420(2),
         PixelFormat::Yuv422p10 => Layout::Planar422(2),
+        PixelFormat::Nv12 => Layout::SemiPlanar420,
     }
 }
 
@@ -122,6 +126,34 @@ fn plane_copies(
             }
             planes
         }
+        Layout::SemiPlanar420 => vec![
+            PlaneCopy {
+                src_offset: 0,
+                dst_offset: 0,
+                src_row_bytes: sw,
+                dst_row_bytes: dw,
+                src_x: sx,
+                dst_x: dx,
+                src_y: sy,
+                dst_y: dy,
+                rows: rh,
+                row_len: rw,
+            },
+            // Interleaved chroma: one byte per luma pixel of span,
+            // half as many rows as luma.
+            PlaneCopy {
+                src_offset: sw * sh,
+                dst_offset: dw * dh,
+                src_row_bytes: sw,
+                dst_row_bytes: dw,
+                src_x: sx,
+                dst_x: dx,
+                src_y: sy / 2,
+                dst_y: dy / 2,
+                rows: rh / 2,
+                row_len: rw,
+            },
+        ],
         Layout::Planar422(sb) => {
             let mut planes = vec![PlaneCopy {
                 src_offset: 0,
@@ -337,6 +369,37 @@ mod tests {
         let back = crop_frame(&padded, 2, 2, 4, 4).expect("crop");
         assert_eq!(back.data, f.data);
         assert_eq!((back.width, back.height), (4, 4));
+    }
+
+    #[test]
+    fn pad_nv12_places_both_planes() {
+        // 4x2 NV12: Y = 10..=17, UV = [50, 60, 51, 61].
+        let mut data: Vec<u8> = (10..18).collect();
+        data.extend_from_slice(&[50, 60, 51, 61]);
+        let f = frame(PixelFormat::Nv12, data, 4, 2);
+        let out = pad_frame(&f, 2, 2, 8, 4).expect("pad");
+        assert_eq!(out.data.len(), 48);
+        let mut y = vec![16u8; 32];
+        y[18] = 10;
+        y[19] = 11;
+        y[20] = 12;
+        y[21] = 13;
+        y[26] = 14;
+        y[27] = 15;
+        y[28] = 16;
+        y[29] = 17;
+        assert_eq!(&out.data[..32], y.as_slice());
+        // UV plane (2 rows of 8): only row 1 carries the source row,
+        // at byte offset 2.
+        let mut uv = vec![128u8; 16];
+        uv[10] = 50;
+        uv[11] = 60;
+        uv[12] = 51;
+        uv[13] = 61;
+        assert_eq!(&out.data[32..], uv.as_slice());
+        // Cropping the window back out is the identity.
+        let back = crop_frame(&out, 2, 2, 4, 2).expect("crop");
+        assert_eq!(back.data, f.data);
     }
 
     #[test]
