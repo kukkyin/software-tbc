@@ -212,8 +212,12 @@ pub trait FrameSink   { fn write_frame(&mut self, f: &VideoFrame) -> Result<(), 
 CLI（`tbc-cli`、バイナリ名 `software-tbc`）:
 
 - 引数: `--input`（`-`=stdin）、`--output`（`-`=stdout）、`--width/--height/--format`、
-  `--preset`、`--config`（TOML）、`--stamp nominal|wall-clock`。
+  `--preset`、`--config`（TOML）、`--stamp nominal|wall-clock`、`--standard ntsc|pal|1080i`。
   優先順位: CLI引数 > 設定ファイル > プリセット > 既定値。
+- `--standard` は規格プリセット（Issue #25）: 幾何・目標レート・フィールド順序を一括指定する。
+  ntsc = 720×480, 30000/1001, bottom-first / pal = 720×576, 25/1, top-first /
+  1080i = 1920×1080, 30000/1001, top-first。解決順序は設定ファイルより上、
+  個別の CLI フラグより下に位置し、個別フラグで上書きできる。
 - `--stamp` は入力フレームの `pts_ns` 生成方式（Issue #20）。`nominal`（既定）は
   連番×公称レートで決定的。`wall-clock` は到着実時刻（単調クロック、初回フレーム=0）とし、
   ライブ入力の実ドリフトや到着ジッタを §4.1 の同期・ドリフト推定が見られるようになる。
