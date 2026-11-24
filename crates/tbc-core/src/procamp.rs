@@ -109,6 +109,17 @@ impl ProcAmp {
             }
             PixelFormat::Yuv420p => self.apply_yuv420p(frame),
             PixelFormat::Rgb24 => self.apply_rgb24(frame),
+            PixelFormat::Yuv420p10 | PixelFormat::Yuv422p10 => {
+                // Process in the 8-bit domain and convert back
+                // (Issue #27); the CLI pipeline converts at its
+                // boundary, so this path serves direct API use.
+                if let Ok(mut f8) = frame.to_8bit() {
+                    self.apply(&mut f8);
+                    if let Ok(back) = VideoFrame::from_8bit(&f8, frame.format) {
+                        frame.data = back.data;
+                    }
+                }
+            }
         }
     }
 
