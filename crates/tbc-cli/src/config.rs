@@ -187,6 +187,38 @@ fn preset(name: &str) -> Result<Overrides, String> {
     Ok(o)
 }
 
+/// Named signal standards (Issue #25): geometry, target rate and
+/// field order for a broadcast standard, as one layer of overrides.
+fn parse_standard(name: &str) -> Result<Overrides, String> {
+    let mut o = Overrides::default();
+    match name {
+        "ntsc" => {
+            o.width = Some(720);
+            o.height = Some(480);
+            o.target_rate = Some(FrameRate::NTSC_29_97);
+            o.field_order = Some(FieldOrder::BottomFieldFirst);
+        }
+        "pal" => {
+            o.width = Some(720);
+            o.height = Some(576);
+            o.target_rate = Some(FrameRate::PAL_25);
+            o.field_order = Some(FieldOrder::TopFieldFirst);
+        }
+        "1080i" => {
+            o.width = Some(1920);
+            o.height = Some(1080);
+            o.target_rate = Some(FrameRate::NTSC_29_97);
+            o.field_order = Some(FieldOrder::TopFieldFirst);
+        }
+        other => {
+            return Err(format!(
+                "unknown standard '{other}' (expected: ntsc | pal | 1080i)"
+            ));
+        }
+    }
+    Ok(o)
+}
+
 /// TOML file shape (flat keys plus a `[procamp]` table, SPEC.md §7).
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -355,6 +387,13 @@ pub fn resolve(args: &Args) -> Result<CliConfig, String> {
         toml_cfg.into_overrides()?.apply_to(&mut cfg);
     }
 
+    // The standard layer sits above TOML (it is an explicit CLI
+    // choice) and below the individual CLI flags, which override it
+    // field by field (Issue #25).
+    if let Some(name) = &args.standard {
+        parse_standard(name)?.apply_to(&mut cfg);
+    }
+
     // CLI layer: only flags the user actually set.
     let mut o = Overrides::default();
     if let Some(v) = args.width {
@@ -398,6 +437,7 @@ mod tests {
             height: None,
             format: None,
             preset: preset.map(str::to_string),
+            standard: None,
             config: config.map(str::to_string),
             stamp: None,
             no_overload_fallback: false,
@@ -508,6 +548,50 @@ mod tests {
         a.no_overload_fallback = true;
         let cfg = resolve(&a).expect("resolve");
         assert!(!cfg.overload_fallback);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn standard_presets_resolve() {
+        let mut a = args(None, None);
+        a.standard = Some("ntsc".to_string());
+        let cfg = resolve(&a).expect("ntsc");
+        assert_eq!((cfg.core.width, cfg.core.height), (720, 480));
+        assert_eq!(cfg.core.target_rate, FrameRate::NTSC_29_97);
+        assert_eq!(cfg.core.field_order, FieldOrder::BottomFieldFirst);
+
+        a.standard = Some("pal".to_string());
+        let cfg = resolve(&a).expect("pal");
+        assert_eq!((cfg.core.width, cfg.core.height), (720, 576));
+        assert_eq!(cfg.core.target_rate, FrameRate::PAL_25);
+        assert_eq!(cfg.core.field_order, FieldOrder::TopFieldFirst);
+
+        a.standard = Some("1080i".to_string());
+        let cfg = resolve(&a).expect("1080i");
+        assert_eq!((cfg.core.width, cfg.core.height), (1920, 1080));
+        assert_eq!(cfg.core.target_rate, FrameRate::NTSC_29_97);
+        assert_eq!(cfg.core.field_order, FieldOrder::TopFieldFirst);
+
+        a.standard = Some("secam".to_string());
+        assert!(resolve(&a).is_err());
+    }
+
+    #[test]
+    fn standard_layer_order() {
+        // TOML sits below the standard layer; individual CLI flags
+        // sit above it.
+        let dir = std::env::temp_dir().join(format!("software-tbc-cli-std-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("tbc.toml");
+        std::fs::write(&path, "width = 352\nheight = 288\n").expect("write toml");
+        let mut a = args(None, path.to_str());
+        a.standard = Some("pal".to_string());
+        let cfg = resolve(&a).expect("resolve");
+        assert_eq!((cfg.core.width, cfg.core.height), (720, 576));
+        a.width = Some(352);
+        let cfg = resolve(&a).expect("resolve");
+        assert_eq!(cfg.core.width, 352);
+        assert_eq!(cfg.core.height, 576);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
