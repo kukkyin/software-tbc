@@ -57,6 +57,13 @@ impl FrameSynchronizer {
         &self.config
     }
 
+    /// Change the rate policy for subsequent outputs (Issue #21's
+    /// overload fallback). The anchor, queue and counters are kept:
+    /// only how due frames are emitted changes.
+    pub fn set_rate_policy(&mut self, policy: RatePolicy) {
+        self.config.rate_policy = policy;
+    }
+
     pub fn dropped_frames(&self) -> u64 {
         self.dropped
     }
@@ -317,6 +324,26 @@ mod tests {
         assert!(first.data.iter().all(|&v| v == 0));
         let second = sync.next_output().expect("second"); // t=DUR -> halfway
         assert!(second.data.iter().all(|&v| v == 100));
+    }
+
+    #[test]
+    fn set_rate_policy_switches_blend_to_hold_drop() {
+        let mut sync = FrameSynchronizer::new(config(RatePolicy::Blend));
+        let mut a = frame(0, 0);
+        a.data = vec![0u8; 24];
+        let mut b = frame(1, 2 * DUR);
+        b.data = vec![200u8; 24];
+        sync.ingest(a);
+        sync.ingest(b);
+        let first = sync.next_output().expect("first"); // t=0 -> a itself
+        assert!(first.data.iter().all(|&v| v == 0));
+        sync.set_rate_policy(RatePolicy::HoldDrop);
+        assert_eq!(sync.config().rate_policy, RatePolicy::HoldDrop);
+        // At t=DUR the blend policy would emit the halfway frame (100);
+        // hold/drop re-emits a (b is not due until 2*DUR) instead.
+        let second = sync.next_output().expect("second");
+        assert!(second.data.iter().all(|&v| v == 0));
+        assert_eq!(sync.duplicated_frames(), 1);
     }
 }
 
