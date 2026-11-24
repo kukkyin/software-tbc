@@ -172,6 +172,12 @@ stdout に JSON レポートが1行だけ出ます。内容はフレーム数、
 software-tbc --analyze-only --input capture.raw --width 720 --height 480 --format yuv422p
 ```
 
+出力例（合成テストパターン、30 フレーム）:
+
+```json
+{"type":"analysis","width":720,"height":480,"format":"yuv422p","runtime_s":3.598,"frames_in":30,"frames_out":30,"dropped_frames":0,"duplicated_frames":0,"signal_present":true,"signal_loss_events":0,"signal_lost_ms":0,"drift_ppm":0,"drift_valid":true,"jitter_samples":13920,"jitter_frames":29,"jitter_unestimated_frames":1,"jitter_bypassed_frames":0,"jitter_mean_abs_px":2.931,"jitter_mean_signed_px":-2.931,"jitter_max_abs_px":3.098,"luma_min":0,"luma_max":255,"range_class":"limited"}
+```
+
 終了コードは、最後まで信号があれば 0、信号断のまま終わった場合（または
 入力が空の場合）は 4 です。
 
