@@ -52,6 +52,9 @@ pub struct CliConfig {
     pub max_shift_px: u32,
     pub stamp: StampMode,
     pub overload_fallback: bool,
+    /// Auto-adapt mode (Issue #32): range estimation and jitter
+    /// search-range adaptation follow the source at runtime.
+    pub auto_adapt: bool,
     pub input: String,
     pub output: String,
     pub max_frames: Option<u64>,
@@ -76,6 +79,7 @@ impl Default for CliConfig {
             max_shift_px: 8,
             stamp: StampMode::Nominal,
             overload_fallback: true,
+            auto_adapt: false,
             input: "-".to_string(),
             output: "-".to_string(),
             max_frames: None,
@@ -112,6 +116,7 @@ struct Overrides {
     max_shift_px: Option<u32>,
     stamp: Option<StampMode>,
     overload_fallback: Option<bool>,
+    auto_adapt: Option<bool>,
     procamp: ProcampOverrides,
 }
 
@@ -202,6 +207,9 @@ impl Overrides {
         }
         if let Some(v) = self.overload_fallback {
             cfg.overload_fallback = v;
+        }
+        if let Some(v) = self.auto_adapt {
+            cfg.auto_adapt = v;
         }
         let p = &mut core.procamp;
         if let Some(v) = self.procamp.luma_gain {
@@ -324,6 +332,7 @@ struct TomlConfig {
     max_shift_px: Option<u32>,
     stamp: Option<String>,
     overload_fallback: Option<bool>,
+    auto_adapt: Option<bool>,
     procamp: Option<TomlProcamp>,
 }
 
@@ -358,6 +367,7 @@ impl TomlConfig {
             telemetry_interval_ms: self.telemetry_interval_ms,
             max_shift_px: self.max_shift_px,
             overload_fallback: self.overload_fallback,
+            auto_adapt: self.auto_adapt,
             ..Default::default()
         };
         if let Some(s) = self.format {
@@ -574,6 +584,9 @@ pub fn resolve(args: &Args) -> Result<CliConfig, String> {
     if args.no_overload_fallback {
         cfg.overload_fallback = false;
     }
+    if args.auto_adapt {
+        cfg.auto_adapt = true;
+    }
 
     cfg.input = args.input.clone();
     cfg.output = args.output.clone();
@@ -705,6 +718,7 @@ mod tests {
             config: config.map(str::to_string),
             stamp: None,
             no_overload_fallback: false,
+            auto_adapt: false,
             max_frames: None,
             fail_on_signal_loss: false,
         }
@@ -729,6 +743,23 @@ mod tests {
     #[test]
     fn unknown_preset_is_an_error() {
         assert!(resolve(&args(Some("betamax"), None)).is_err());
+    }
+
+    #[test]
+    fn auto_adapt_resolves_from_toml_and_cli() {
+        let dir =
+            std::env::temp_dir().join(format!("software-tbc-cli-adapt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("tbc.toml");
+        std::fs::write(&path, "auto_adapt = true\n").expect("write toml");
+        let cfg = resolve(&args(None, path.to_str())).expect("resolve");
+        assert!(cfg.auto_adapt);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let mut a = args(None, None);
+        assert!(!resolve(&a).expect("resolve").auto_adapt);
+        a.auto_adapt = true;
+        assert!(resolve(&a).expect("resolve").auto_adapt);
     }
 
     #[test]
