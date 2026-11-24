@@ -24,7 +24,9 @@ use tbc_core::procamp::ProcAmp;
 use tbc_core::sync::ring::RingBuffer;
 use tbc_core::sync::FrameSynchronizer;
 use tbc_core::telemetry::TelemetryCollector;
-use tbc_core::{FieldOrder, FrameRate, PixelFormat, RatePolicy, TbcError, VideoFrame};
+use tbc_core::{
+    FieldOrder, FrameRate, PixelFormat, RatePolicy, SignalLossPolicy, TbcError, VideoFrame,
+};
 use tbc_io::{
     FrameSink, FrameSource, IoError, RawGeometry, RawReader, RawWriter, SequenceSink,
     SequenceSource,
@@ -105,6 +107,11 @@ pub struct Args {
     /// always uses nominal.
     #[arg(long)]
     stamp: Option<String>,
+    /// Signal-loss policy: last-frame-hold | blackout | test-pattern |
+    /// passthrough (while the signal is lost, send the input through
+    /// unprocessed instead of substituting a fallback frame).
+    #[arg(long)]
+    signal_loss: Option<String>,
     /// Disable the overload fallback (staged degradation that only
     /// engages in wall-clock stamp mode).
     #[arg(long)]
@@ -442,10 +449,12 @@ impl Pipeline {
         cfg: &config::CliConfig,
         sink: &mut Box<dyn FrameSink + Send>,
     ) -> bool {
-        if self.guard.is_lost() {
+        if self.guard.is_lost() && cfg.core.signal_loss != SignalLossPolicy::Passthrough {
             // Substitute the policy fallback until the signal recovers.
             // Fallbacks are generated in the pipeline's format; `emit`
             // re-packs them into the wire format (Issue #24).
+            // Passthrough (Issue #34) substitutes nothing and falls
+            // through to the unprocessed path below.
             let format = pipeline_format(cfg.core.format);
             if let Some(mut fb) = self
                 .guard
@@ -459,6 +468,17 @@ impl Pipeline {
         }
         match self.sync.next_output() {
             Some(mut out) => {
+                // Passthrough (Issue #34): while the guard reports
+                // signal loss (reachable here only with the
+                // passthrough policy), every correction stage is
+                // bypassed and the estimators are not fed, so their
+                // state survives the outage untouched. Synchronisation
+                // above and wire conversion / padding in `emit` still
+                // apply, and no frame is fabricated: when the
+                // synchronizer returns nothing, nothing is emitted.
+                if self.guard.is_lost() {
+                    return self.emit(cfg, sink, out);
+                }
                 // Conceal head-switching noise before jitter
                 // estimation sees the frame (Issue #29).
                 apply_head_switch(&mut out, &cfg.core.head_switch);
@@ -1037,5 +1057,125 @@ mod tests {
         );
         assert_eq!(pipeline_format(PixelFormat::Uyvy), PixelFormat::Yuv422p);
         assert_eq!(pipeline_format(PixelFormat::Rgb24), PixelFormat::Rgb24);
+    }
+
+    /// In-memory sink for pipeline tests (Issue #34).
+    struct VecSink {
+        frames: Arc<Mutex<Vec<VideoFrame>>>,
+    }
+
+    impl FrameSink for VecSink {
+        fn write_frame(&mut self, frame: &VideoFrame) -> Result<(), IoError> {
+            self.frames.lock().expect("frames").push(frame.clone());
+            Ok(())
+        }
+        fn flush(&mut self) -> Result<(), IoError> {
+            Ok(())
+        }
+    }
+
+    /// 4x2 config whose correction stages are all visibly non-neutral
+    /// (proc-amp luma gain 2.0, one head-switch line), so a processed
+    /// frame can never equal the input bytes.
+    fn passthrough_cfg(policy: SignalLossPolicy) -> config::CliConfig {
+        let mut cfg = config::CliConfig::default();
+        cfg.core.width = 4;
+        cfg.core.height = 2;
+        cfg.core.signal_loss = policy;
+        cfg.core.procamp.luma_gain = 2.0;
+        cfg.core.head_switch.lines = 1;
+        cfg.input_width = 4;
+        cfg.input_height = 2;
+        cfg.output_width = 4;
+        cfg.output_height = 2;
+        cfg
+    }
+
+    fn passthrough_pipeline(cfg: &config::CliConfig) -> Pipeline {
+        let core = cfg.core.clone();
+        Pipeline {
+            sync: FrameSynchronizer::new(core.clone()),
+            procamp: ProcAmp::new(core.procamp),
+            detector: None,
+            guard: SignalGuard::new(core.signal_loss, cfg.signal_loss_timeout_ms),
+            collector: TelemetryCollector::new(),
+            controller: OverloadController::new(false, false, false, 33_366_666),
+            auto_order: None,
+            range_estimator: None,
+            jitter_adapter: None,
+            applied_hold_drop: false,
+            frames_out: 0,
+            last_emitted_seq: None,
+            last_output_pts: 0,
+            last_input_pts: 0,
+            prev_dropped: 0,
+            prev_duplicated: 0,
+            output_error: false,
+        }
+    }
+
+    fn frame_4x2() -> VideoFrame {
+        VideoFrame {
+            width: 4,
+            height: 2,
+            format: PixelFormat::Yuv422p,
+            field_order: FieldOrder::Progressive,
+            pts_ns: 0,
+            sequence: 0,
+            data: vec![
+                100, 128, 100, 128, 100, 128, 100, 128, // line 0
+                90, 128, 90, 128, 90, 128, 90, 128, // line 1
+            ],
+        }
+    }
+
+    fn run_one(cfg: &config::CliConfig, pipe: &mut Pipeline) -> Vec<VideoFrame> {
+        let frames = Arc::new(Mutex::new(Vec::new()));
+        let mut sink: Box<dyn FrameSink + Send> = Box::new(VecSink {
+            frames: Arc::clone(&frames),
+        });
+        assert!(pipe.process_output(cfg, &mut sink));
+        let out = frames.lock().expect("frames").clone();
+        out
+    }
+
+    #[test]
+    fn passthrough_emits_the_frame_unprocessed_while_lost() {
+        let cfg = passthrough_cfg(SignalLossPolicy::Passthrough);
+        let mut pipe = passthrough_pipeline(&cfg);
+        for _ in 0..3 {
+            pipe.guard.note_bad_frame();
+        }
+        assert!(pipe.guard.is_lost());
+        pipe.sync.ingest(frame_4x2());
+        let out = run_one(&cfg, &mut pipe);
+        assert_eq!(out.len(), 1);
+        // No head-switch masking, no proc-amp: bytes are untouched.
+        assert_eq!(out[0].data, frame_4x2().data);
+    }
+
+    #[test]
+    fn passthrough_processes_normally_when_not_lost() {
+        let cfg = passthrough_cfg(SignalLossPolicy::Passthrough);
+        let mut pipe = passthrough_pipeline(&cfg);
+        pipe.sync.ingest(frame_4x2());
+        let out = run_one(&cfg, &mut pipe);
+        assert_eq!(out.len(), 1);
+        assert_ne!(out[0].data, frame_4x2().data);
+    }
+
+    #[test]
+    fn blackout_still_substitutes_a_fallback_while_lost() {
+        let cfg = passthrough_cfg(SignalLossPolicy::Blackout);
+        let mut pipe = passthrough_pipeline(&cfg);
+        for _ in 0..3 {
+            pipe.guard.note_bad_frame();
+        }
+        assert!(pipe.guard.is_lost());
+        pipe.sync.ingest(frame_4x2());
+        let out = run_one(&cfg, &mut pipe);
+        assert_eq!(out.len(), 1);
+        // Broadcast black in packed 422: [16, 128, 16, 128] quads.
+        assert_eq!(out[0].data, [16, 128, 16, 128].repeat(4));
     }
 }
