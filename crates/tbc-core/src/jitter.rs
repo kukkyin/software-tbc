@@ -4,6 +4,14 @@
 //! is displaced relative to a reference (the same line of the previous
 //! frame) by normalised cross-correlation with parabolic peak
 //! interpolation; correction shifts lines back by the inverse amount.
+//!
+//! Performance notes (Issue #19): detection works on luma planes extracted
+//! once per frame into reused buffers (the previous frame's plane is kept
+//! as the reference instead of re-extracting it per line), and the Pearson
+//! correlation for every candidate shift is computed from integer sums:
+//! prefix sums make the per-shift means/variances O(1), leaving a single
+//! multiply-accumulate loop for the cross term. No heap allocation happens
+//! per line; scratch buffers live in the detector.
 
 use crate::{PixelFormat, TbcError, VideoFrame};
 
@@ -16,8 +24,51 @@ pub struct LineShift {
     pub shift_q8: i32,
 }
 
+/// Extract the full luma plane of a frame into `out` (width*height bytes),
+/// reusing the buffer's capacity. Returns `false` when the frame data is
+/// shorter than its declared geometry.
+fn extract_luma(frame: &VideoFrame, out: &mut Vec<u8>) -> bool {
+    let w = frame.width as usize;
+    let h = frame.height as usize;
+    if frame.data.len() < frame.format.frame_size(frame.width, frame.height) {
+        return false;
+    }
+    out.clear();
+    out.resize(w * h, 0);
+    match frame.format {
+        PixelFormat::Yuv420p => {
+            out.copy_from_slice(&frame.data[..w * h]);
+        }
+        PixelFormat::Yuv422p => {
+            for l in 0..h {
+                let src = &frame.data[l * w * 2..(l + 1) * w * 2];
+                let dst = &mut out[l * w..(l + 1) * w];
+                for x in 0..w {
+                    dst[x] = src[x * 2];
+                }
+            }
+        }
+        PixelFormat::Rgb24 => {
+            for l in 0..h {
+                let src = &frame.data[l * w * 3..l * w * 3 + w * 3];
+                let dst = &mut out[l * w..l * w + w];
+                for x in 0..w {
+                    let (r, g, b) = (
+                        src[x * 3] as u32,
+                        src[x * 3 + 1] as u32,
+                        src[x * 3 + 2] as u32,
+                    );
+                    dst[x] = ((r * 77 + g * 150 + b * 29) >> 8) as u8;
+                }
+            }
+        }
+    }
+    true
+}
+
 /// Extract one line of luma samples from a frame, whatever its layout.
-/// Returns `None` for an out-of-range line.
+/// Returns `None` for an out-of-range line. Used by the field module;
+/// the detector itself works on whole planes (see `extract_luma`).
 pub(crate) fn luma_row(frame: &VideoFrame, line: u32) -> Option<Vec<u8>> {
     if line >= frame.height {
         return None;
@@ -52,41 +103,98 @@ pub(crate) fn luma_row(frame: &VideoFrame, line: u32) -> Option<Vec<u8>> {
     Some(row)
 }
 
-/// Pearson correlation between `a[x]` and `b[x + shift]` over the overlap.
-fn correlation(a: &[u8], b: &[u8], shift: i32) -> f64 {
-    let mut sum_a = 0.0f64;
-    let mut sum_b = 0.0f64;
-    let mut count = 0usize;
-    for (x, &av) in a.iter().enumerate() {
-        let bx = x as i32 + shift;
-        if bx < 0 || bx as usize >= b.len() {
-            continue;
-        }
-        sum_a += av as f64;
-        sum_b += b[bx as usize] as f64;
-        count += 1;
+/// Prefix sums of a row: `sum[i]` = sum of the first `i` samples,
+/// `sq[i]` = sum of their squares. Buffers are reused across calls and
+/// every entry is overwritten, so nothing is cleared per call.
+fn prefix_sums(row: &[u8], sum: &mut Vec<u64>, sq: &mut Vec<u64>) {
+    if sum.len() < row.len() + 1 {
+        sum.resize(row.len() + 1, 0);
+        sq.resize(row.len() + 1, 0);
     }
+    sum[0] = 0;
+    sq[0] = 0;
+    for (i, &v) in row.iter().enumerate() {
+        let v = v as u64;
+        sum[i + 1] = sum[i] + v;
+        sq[i + 1] = sq[i] + v * v;
+    }
+}
+
+/// Sum of `buf[from..to]` from a prefix-sum table.
+fn range_sum(prefix: &[u64], from: usize, to: usize) -> u64 {
+    prefix[to] - prefix[from]
+}
+
+/// Pearson correlation between `a[x]` and `b[x + shift]` over the overlap,
+/// from precomputed prefix sums of both rows plus one cross-term loop.
+fn correlation(
+    a: &[u8],
+    a_sum: &[u64],
+    a_sq: &[u64],
+    b: &[u8],
+    b_sum: &[u64],
+    b_sq: &[u64],
+    shift: i32,
+) -> f64 {
+    let w = a.len() as i32;
+    let x0 = (-shift).max(0);
+    let x1 = (w - shift).min(w);
+    if x0 >= x1 {
+        return 0.0;
+    }
+    let (x0, x1) = (x0 as usize, x1 as usize);
+    let count = x1 - x0;
     if count < 8 {
         return 0.0;
     }
-    let mean_a = sum_a / count as f64;
-    let mean_b = sum_b / count as f64;
-    let (mut cov, mut var_a, mut var_b) = (0.0f64, 0.0f64, 0.0f64);
-    for (x, &av) in a.iter().enumerate() {
-        let bx = x as i32 + shift;
-        if bx < 0 || bx as usize >= b.len() {
-            continue;
-        }
-        let da = av as f64 - mean_a;
-        let db = b[bx as usize] as f64 - mean_b;
-        cov += da * db;
-        var_a += da * da;
-        var_b += db * db;
-    }
+    let (b0, b1) = ((x0 as i32 + shift) as usize, (x1 as i32 + shift) as usize);
+    let sum_a = range_sum(a_sum, x0, x1) as f64;
+    let sum_b = range_sum(b_sum, b0, b1) as f64;
+    let sq_a = range_sum(a_sq, x0, x1) as f64;
+    let sq_b = range_sum(b_sq, b0, b1) as f64;
+    // Zip iteration over the two overlap windows: no index arithmetic
+    // and no per-sample bounds checks in the hot loop.
+    let sum_ab: u64 = a[x0..x1]
+        .iter()
+        .zip(b[b0..b1].iter())
+        .map(|(&u, &v)| u as u64 * v as u64)
+        .sum();
+    let n = count as f64;
+    let cov = sum_ab as f64 - sum_a * sum_b / n;
+    let var_a = sq_a - sum_a * sum_a / n;
+    let var_b = sq_b - sum_b * sum_b / n;
     if var_a <= 0.0 || var_b <= 0.0 {
         return 0.0;
     }
-    cov / (var_a.sqrt() * var_b.sqrt())
+    cov / (var_a * var_b).sqrt()
+}
+
+/// Evaluate the correlation for every shift in `range`, recording the
+/// values in `corrs` (indexed by shift + max_shift_px) and returning the
+/// best (shift, correlation) pair.
+#[allow(clippy::too_many_arguments)]
+fn eval_shifts(
+    reference: &[u8],
+    a_sum: &[u64],
+    a_sq: &[u64],
+    current: &[u8],
+    b_sum: &[u64],
+    b_sq: &[u64],
+    range: std::ops::RangeInclusive<i32>,
+    max_shift_px: i32,
+    corrs: &mut [f64],
+) -> (i32, f64) {
+    let mut best_shift = 0i32;
+    let mut best_corr = f64::NEG_INFINITY;
+    for s in range {
+        let c = correlation(reference, a_sum, a_sq, current, b_sum, b_sq, s);
+        corrs[(s + max_shift_px) as usize] = c;
+        if c > best_corr {
+            best_corr = c;
+            best_shift = s;
+        }
+    }
+    (best_shift, best_corr)
 }
 
 /// Stateful per-line jitter detector. Feed frames in order.
@@ -94,7 +202,33 @@ fn correlation(a: &[u8], b: &[u8], shift: i32) -> f64 {
 pub struct JitterDetector {
     max_shift_px: i32,
     min_mean_correlation: f64,
-    previous: Option<VideoFrame>,
+    /// Luma plane of the previous frame (the reference), if any.
+    previous_luma: Option<Vec<u8>>,
+    previous_width: u32,
+    previous_height: u32,
+    /// Scratch: luma plane of the frame being analysed.
+    current_luma: Vec<u8>,
+    /// Scratch prefix sums for the current row and the reference row.
+    a_sum: Vec<u64>,
+    a_sq: Vec<u64>,
+    b_sum: Vec<u64>,
+    b_sq: Vec<u64>,
+    /// Scratch correlation values for the candidate shifts of one line.
+    corrs: Vec<f64>,
+    /// Best integer-pixel shift per line from the last accepted frame,
+    /// used as the centre of the next frame's narrow search window.
+    prev_best_shifts: Vec<i32>,
+    /// Prefix-sum tables of the reference (previous) frame's luma plane,
+    /// flat: one (sum, sq) pair of rows of length width+1 per line. They
+    /// are built while that frame was the current one, so the reference
+    /// side of the correlation never pays the build cost twice.
+    ref_sum: Vec<u64>,
+    ref_sq: Vec<u64>,
+    /// Tables being accumulated for the current frame, swapped into
+    /// `ref_sum`/`ref_sq` when the frame becomes the reference.
+    next_ref_sum: Vec<u64>,
+    next_ref_sq: Vec<u64>,
+    ref_tables_valid: bool,
 }
 
 impl JitterDetector {
@@ -102,7 +236,21 @@ impl JitterDetector {
         JitterDetector {
             max_shift_px: max_shift_px as i32,
             min_mean_correlation: 0.3,
-            previous: None,
+            previous_luma: None,
+            previous_width: 0,
+            previous_height: 0,
+            current_luma: Vec::new(),
+            a_sum: Vec::new(),
+            a_sq: Vec::new(),
+            b_sum: Vec::new(),
+            b_sq: Vec::new(),
+            corrs: Vec::new(),
+            prev_best_shifts: Vec::new(),
+            ref_sum: Vec::new(),
+            ref_sq: Vec::new(),
+            next_ref_sum: Vec::new(),
+            next_ref_sq: Vec::new(),
+            ref_tables_valid: false,
         }
     }
 
@@ -112,36 +260,132 @@ impl JitterDetector {
     /// unrelated content); the caller must then skip correction for this
     /// frame. The frame is always remembered as the next reference.
     pub fn estimate(&mut self, frame: &VideoFrame) -> Option<Vec<LineShift>> {
+        if !extract_luma(frame, &mut self.current_luma) {
+            return None;
+        }
+        let w = frame.width as usize;
+        let have_reference = self.previous_luma.is_some()
+            && self.previous_width == frame.width
+            && self.previous_height == frame.height;
+        // Size the table buffers for this geometry (rows of width+1).
+        let table_need = (w + 1) * frame.height as usize;
+        if self.next_ref_sum.len() != table_need {
+            self.next_ref_sum.resize(table_need, 0);
+            self.next_ref_sq.resize(table_need, 0);
+        }
+        let use_ref_tables = have_reference && self.ref_tables_valid;
+        self.corrs.resize((2 * self.max_shift_px + 1) as usize, 0.0);
         let mut shifts = Vec::with_capacity(frame.height as usize);
         let mut corr_sum = 0.0f64;
         let mut corr_count = 0usize;
+        // Frame-to-frame tracking (Issue #19): a given line's jitter
+        // changes only slightly between consecutive frames, so each line
+        // first searches a narrow window around that line's peak in the
+        // previous accepted frame. A weak or edge-of-window peak falls
+        // back to a full search for that line.
+        let mut best_shifts: Vec<i32> = Vec::with_capacity(frame.height as usize);
         for line in 0..frame.height {
-            let current = luma_row(frame, line)?;
-            let reference = match &self.previous {
-                Some(prev) => luma_row(prev, line),
-                None if line > 0 => luma_row(frame, line - 1),
-                None => None,
+            let l = line as usize;
+            let current: &[u8] = &self.current_luma[l * w..l * w + w];
+            // Build the current row's prefix tables first and cache them
+            // for the next frame — for every line, including line 0,
+            // which may have no reference to compare against this time.
+            prefix_sums(current, &mut self.b_sum, &mut self.b_sq);
+            {
+                let off = l * (w + 1);
+                self.next_ref_sum[off..off + w + 1].copy_from_slice(&self.b_sum[..w + 1]);
+                self.next_ref_sq[off..off + w + 1].copy_from_slice(&self.b_sq[..w + 1]);
+            }
+            let reference: Option<&[u8]> = if have_reference {
+                let prev = self.previous_luma.as_ref().expect("checked above");
+                Some(&prev[l * w..l * w + w])
+            } else if line > 0 {
+                Some(&self.current_luma[(l - 1) * w..(l - 1) * w + w])
+            } else {
+                None
             };
             let Some(reference) = reference else {
                 shifts.push(LineShift { line, shift_q8: 0 });
+                best_shifts.push(0);
                 continue;
             };
-            let mut best_shift = 0i32;
-            let mut best_corr = f64::NEG_INFINITY;
-            let mut corrs = Vec::with_capacity((2 * self.max_shift_px + 1) as usize);
-            for s in -self.max_shift_px..=self.max_shift_px {
-                let c = correlation(&reference, &current, s);
-                corrs.push(c);
-                if c > best_corr {
-                    best_corr = c;
-                    best_shift = s;
-                }
+            // Argument order matters: the reference is `a`, the current
+            // row is `b`, and the shift indexes into `b` (as in the
+            // original two-pass implementation). The reference tables
+            // usually come from the cache built during the previous
+            // frame; the current row's tables are built now and cached
+            // for the next frame.
+            let (a_sum, a_sq): (&[u64], &[u64]) = if use_ref_tables {
+                let off = l * (w + 1);
+                (
+                    &self.ref_sum[off..off + w + 1],
+                    &self.ref_sq[off..off + w + 1],
+                )
+            } else {
+                prefix_sums(reference, &mut self.a_sum, &mut self.a_sq);
+                (&self.a_sum, &self.a_sq)
+            };
+            let (a_sum, a_sq, b_sum, b_sq) = (a_sum, a_sq, &self.b_sum[..], &self.b_sq[..]);
+            for slot in self.corrs.iter_mut() {
+                *slot = f64::NEG_INFINITY;
             }
+            let max = self.max_shift_px;
+            let full = -max..=max;
+            let center = if self.prev_best_shifts.len() == frame.height as usize {
+                Some(self.prev_best_shifts[l])
+            } else {
+                None
+            };
+            let (best_shift, best_corr) = match center {
+                Some(t) => {
+                    let lo = (t - 1).max(-max);
+                    let hi = (t + 1).min(max);
+                    let (bs, bc) = eval_shifts(
+                        reference,
+                        a_sum,
+                        a_sq,
+                        current,
+                        b_sum,
+                        b_sq,
+                        lo..=hi,
+                        max,
+                        &mut self.corrs,
+                    );
+                    let at_window_edge = (bs == lo && lo > -max) || (bs == hi && hi < max);
+                    if bc < 0.5 || at_window_edge {
+                        eval_shifts(
+                            reference,
+                            a_sum,
+                            a_sq,
+                            current,
+                            b_sum,
+                            b_sq,
+                            full,
+                            max,
+                            &mut self.corrs,
+                        )
+                    } else {
+                        (bs, bc)
+                    }
+                }
+                None => eval_shifts(
+                    reference,
+                    a_sum,
+                    a_sq,
+                    current,
+                    b_sum,
+                    b_sq,
+                    full,
+                    max,
+                    &mut self.corrs,
+                ),
+            };
+            best_shifts.push(best_shift);
             // Parabolic interpolation around the peak for sub-pixel reach.
             let idx = (best_shift + self.max_shift_px) as usize;
             let mut frac = 0.0f64;
-            if idx > 0 && idx + 1 < corrs.len() {
-                let (cm, c0, cp) = (corrs[idx - 1], corrs[idx], corrs[idx + 1]);
+            if idx > 0 && idx + 1 < self.corrs.len() {
+                let (cm, c0, cp) = (self.corrs[idx - 1], self.corrs[idx], self.corrs[idx + 1]);
                 let denom = cm - 2.0 * c0 + cp;
                 if denom.abs() > f64::EPSILON {
                     frac = (0.5 * (cm - cp) / denom).clamp(-1.0, 1.0);
@@ -152,10 +396,25 @@ impl JitterDetector {
             corr_sum += best_corr;
             corr_count += 1;
         }
-        self.previous = Some(frame.clone());
+        // The current plane becomes the next frame's reference; keep
+        // the old reference buffer around as next time's scratch.
+        let new_previous = std::mem::take(&mut self.current_luma);
+        if let Some(old) = self.previous_luma.replace(new_previous) {
+            self.current_luma = old;
+        }
+        self.previous_width = frame.width;
+        self.previous_height = frame.height;
+        // The tables accumulated for this frame become the reference
+        // tables for the next one.
+        std::mem::swap(&mut self.ref_sum, &mut self.next_ref_sum);
+        std::mem::swap(&mut self.ref_sq, &mut self.next_ref_sq);
+        self.ref_tables_valid = true;
         if corr_count == 0 || corr_sum / corr_count as f64 <= self.min_mean_correlation {
             return None;
         }
+        // Only accepted frames teach the tracker: a rejected frame's
+        // peaks are not trustworthy starting points for the next frame.
+        self.prev_best_shifts = best_shifts;
         median_filter(&mut shifts);
         Some(shifts)
     }
@@ -181,13 +440,19 @@ fn shift_row(row: &[u8], shift_q8: i32, out: &mut [u8]) {
     if n == 0 {
         return;
     }
+    // The integer/fraction parts of the source position are the same for
+    // every output sample (the position is x*256 - shift_q8), so the
+    // Euclidean division is hoisted out of the loop (Issue #19: per-sample
+    // division dominated this function's cost). The weighted sum is
+    // always non-negative, so `>> 8` replaces the division by 256.
+    let q = shift_q8.div_euclid(256);
+    let r = shift_q8.rem_euclid(256);
+    let (i0_off, frac) = if r == 0 { (-q, 0) } else { (-q - 1, 256 - r) };
     for (x, o) in out.iter_mut().enumerate() {
-        let src_q8 = x as i32 * 256 - shift_q8;
-        let i0 = src_q8.div_euclid(256);
-        let frac = src_q8.rem_euclid(256);
+        let i0 = x as i32 + i0_off;
         let a = row[i0.clamp(0, n - 1) as usize] as i32;
         let b = row[(i0 + 1).clamp(0, n - 1) as usize] as i32;
-        *o = ((a * (256 - frac) + b * frac + 128) / 256) as u8;
+        *o = ((a * (256 - frac) + b * frac + 128) >> 8) as u8;
     }
 }
 
@@ -202,38 +467,47 @@ pub fn apply_shifts(frame: &mut VideoFrame, shifts: &[LineShift]) -> Result<(), 
     }
     let w = frame.width as usize;
     let line_bytes = w * 2;
+    // Scratch rows, allocated once and reused for every line (Issue #19).
+    let mut line_copy = vec![0u8; line_bytes];
+    let mut y_row = vec![0u8; w];
+    let mut cb_row = vec![0u8; w / 2];
+    let mut cr_row = vec![0u8; w / 2];
+    let mut y_out = vec![0u8; w];
+    let mut cb_out = vec![0u8; w / 2];
+    let mut cr_out = vec![0u8; w / 2];
     for shift in shifts {
         let l = shift.line as usize;
         if l >= frame.height as usize || shift.shift_q8 == 0 {
             continue;
         }
         let start = l * line_bytes;
-        let line_data = frame.data[start..start + line_bytes].to_vec();
+        line_copy.copy_from_slice(&frame.data[start..start + line_bytes]);
         // De-interleave into Y and the two chroma rows.
-        let mut y_row = vec![0u8; w];
-        let mut cb_row = vec![0u8; w / 2];
-        let mut cr_row = vec![0u8; w / 2];
-        for x in 0..w {
-            y_row[x] = line_data[x * 2];
+        for (dst, pair) in y_row.iter_mut().zip(line_copy.chunks_exact(2)) {
+            *dst = pair[0];
         }
-        for i in 0..w / 2 {
-            cb_row[i] = line_data[i * 4 + 1];
-            cr_row[i] = line_data[i * 4 + 3];
+        for ((cb, cr), quad) in cb_row
+            .iter_mut()
+            .zip(cr_row.iter_mut())
+            .zip(line_copy.chunks_exact(4))
+        {
+            *cb = quad[1];
+            *cr = quad[3];
         }
-        let mut y_out = vec![0u8; w];
-        let mut cb_out = vec![0u8; w / 2];
-        let mut cr_out = vec![0u8; w / 2];
         shift_row(&y_row, -shift.shift_q8, &mut y_out);
         // Chroma has half the horizontal resolution: half the displacement.
         shift_row(&cb_row, -shift.shift_q8 / 2, &mut cb_out);
         shift_row(&cr_row, -shift.shift_q8 / 2, &mut cr_out);
         let line_mut = &mut frame.data[start..start + line_bytes];
-        for x in 0..w {
-            line_mut[x * 2] = y_out[x];
+        for (pair, &y) in line_mut.chunks_exact_mut(2).zip(y_out.iter()) {
+            pair[0] = y;
         }
-        for i in 0..w / 2 {
-            line_mut[i * 4 + 1] = cb_out[i];
-            line_mut[i * 4 + 3] = cr_out[i];
+        for (quad, (cb, cr)) in line_mut
+            .chunks_exact_mut(4)
+            .zip(cb_out.iter().zip(cr_out.iter()))
+        {
+            quad[1] = *cb;
+            quad[3] = *cr;
         }
     }
     Ok(())
