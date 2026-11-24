@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tbc_core::field::FieldOrderDetector;
 use tbc_core::guard::SignalGuard;
+use tbc_core::head_switch::apply_head_switch;
 use tbc_core::jitter::{apply_shifts, JitterDetector};
 use tbc_core::procamp::ProcAmp;
 use tbc_core::sync::ring::RingBuffer;
@@ -57,6 +58,13 @@ pub struct Args {
     /// the fallback until detection locks).
     #[arg(long)]
     field_order: Option<String>,
+    /// Conceal this many bottom lines (head-switching noise);
+    /// 0 = off.
+    #[arg(long)]
+    head_switch_lines: Option<u32>,
+    /// Head-switch concealment mode: replicate | interpolate.
+    #[arg(long)]
+    head_switch_mode: Option<String>,
     /// Named preset: vhs | svhs | unstable-composite | low-latency.
     #[arg(long)]
     preset: Option<String>,
@@ -393,6 +401,9 @@ impl Pipeline {
         }
         match self.sync.next_output() {
             Some(mut out) => {
+                // Conceal head-switching noise before jitter
+                // estimation sees the frame (Issue #29).
+                apply_head_switch(&mut out, &cfg.core.head_switch);
                 if !self.controller.skip_jitter() {
                     if let Some(det) = self.detector.as_mut() {
                         if let Some(shifts) = det.estimate(&out) {
