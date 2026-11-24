@@ -48,7 +48,8 @@ pub struct Args {
     /// Frame height in pixels.
     #[arg(long)]
     height: Option<u32>,
-    /// Pixel format: yuv420p | yuv422p | rgb24 | uyvy | yuyv.
+    /// Pixel format: yuv420p | yuv422p | rgb24 | uyvy | yuyv |
+    /// yuv420p10le | yuv422p10le.
     #[arg(long)]
     format: Option<String>,
     /// Field order: progressive | top-first | bottom-first | auto
@@ -284,11 +285,26 @@ fn open_sink(cfg: &config::CliConfig) -> Result<Box<dyn FrameSink + Send>, IoErr
     Ok(Box::new(RawWriter::new(writer)))
 }
 
+/// The format the pipeline processes for a declared wire format:
+/// packed 422 (Issue #24) and the 10-bit formats (Issue #28) are
+/// converted at the boundary; everything else is processed as-is.
+fn pipeline_format(wire: PixelFormat) -> PixelFormat {
+    match wire {
+        PixelFormat::Yuv422p10 => PixelFormat::Yuv422p,
+        PixelFormat::Yuv420p10 => PixelFormat::Yuv420p,
+        f if f.is_packed_422() => PixelFormat::Yuv422p,
+        f => f,
+    }
+}
+
 /// Re-pack a pipeline frame into the declared wire format (Issue #24).
 /// Packed formats (uyvy/yuyv) are converted from the pipeline's
-/// yuv422p representation; every other format passes through unchanged.
+/// yuv422p representation and 10-bit formats from their 8-bit
+/// equivalent (Issue #28); every other format passes through unchanged.
 fn to_wire_frame(wire: PixelFormat, frame: VideoFrame) -> Result<VideoFrame, TbcError> {
-    if wire.is_packed_422() {
+    if wire.is_10bit() {
+        VideoFrame::from_8bit(&frame, wire)
+    } else if wire.is_packed_422() {
         VideoFrame::from_yuv422p(&frame, wire)
     } else {
         Ok(frame)
@@ -364,11 +380,7 @@ impl Pipeline {
             // Substitute the policy fallback until the signal recovers.
             // Fallbacks are generated in the pipeline's format; `emit`
             // re-packs them into the wire format (Issue #24).
-            let format = if cfg.core.format.is_packed_422() {
-                PixelFormat::Yuv422p
-            } else {
-                cfg.core.format
-            };
+            let format = pipeline_format(cfg.core.format);
             if let Some(mut fb) = self
                 .guard
                 .fallback_frame(cfg.core.width, cfg.core.height, format)
@@ -416,13 +428,11 @@ impl Pipeline {
 
 fn run(cfg: &config::CliConfig) -> i32 {
     let mut core = cfg.core.clone();
-    // Packed boundary formats (uyvy/yuyv) are processed in the
-    // pipeline's yuv422p representation (Issue #24): the reader thread
-    // converts on the way in and `emit` re-packs on the way out.
-    // `cfg.core` keeps the declared wire format for I/O geometry.
-    if core.format.is_packed_422() {
-        core.format = PixelFormat::Yuv422p;
-    }
+    // Boundary formats (packed 422, 10-bit) are processed in their
+    // 8-bit pipeline representation (Issues #24, #28): the reader
+    // thread converts on the way in and `emit` re-packs on the way
+    // out. `cfg.core` keeps the declared wire format for I/O geometry.
+    core.format = pipeline_format(core.format);
     let mut source = match open_source(cfg) {
         Ok(s) => s,
         Err(e) => {
@@ -491,6 +501,18 @@ fn run(cfg: &config::CliConfig) -> i32 {
                         // pipeline's yuv422p representation (Issue #24).
                         if frame.format.is_packed_422() {
                             match frame.to_yuv422p() {
+                                Ok(converted) => frame = converted,
+                                Err(e) => {
+                                    *reader_error.lock().expect("error slot") =
+                                        Some(IoError::Core(e));
+                                    break 'read;
+                                }
+                            }
+                        }
+                        // Convert 10-bit boundary formats into the
+                        // pipeline's 8-bit representation (Issue #28).
+                        if frame.format.is_10bit() {
+                            match frame.to_8bit() {
                                 Ok(converted) => frame = converted,
                                 Err(e) => {
                                     *reader_error.lock().expect("error slot") =
@@ -816,5 +838,50 @@ mod tests {
         let out = to_wire_frame(PixelFormat::Yuv422p, frame).expect("passthrough");
         assert_eq!(out.format, PixelFormat::Yuv422p);
         assert_eq!(out.data, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn wire_frame_expands_for_10bit_formats() {
+        // 422p10: the packed frame becomes planar u16 planes
+        // (Y plane, then U, then V), samples scaled to 10-bit.
+        let out = to_wire_frame(
+            PixelFormat::Yuv422p10,
+            frame422(vec![20, 10, 40, 30, 60, 50, 80, 70]),
+        )
+        .expect("expand 422p10");
+        assert_eq!(out.format, PixelFormat::Yuv422p10);
+        let samples: Vec<u16> = out
+            .data
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        // Y = [20, 40, 60, 80], U = [10, 50], V = [30, 70], scaled
+        // with (v * 1023 + 127) / 255.
+        let scale = |v: u8| ((v as u32 * 1023 + 127) / 255) as u16;
+        assert_eq!(
+            samples,
+            vec![
+                scale(20),
+                scale(40),
+                scale(60),
+                scale(80),
+                scale(10),
+                scale(50),
+                scale(30),
+                scale(70)
+            ]
+        );
+        // The pipeline format mapping pairs each wire format with
+        // its 8-bit representation.
+        assert_eq!(
+            pipeline_format(PixelFormat::Yuv422p10),
+            PixelFormat::Yuv422p
+        );
+        assert_eq!(
+            pipeline_format(PixelFormat::Yuv420p10),
+            PixelFormat::Yuv420p
+        );
+        assert_eq!(pipeline_format(PixelFormat::Uyvy), PixelFormat::Yuv422p);
+        assert_eq!(pipeline_format(PixelFormat::Rgb24), PixelFormat::Rgb24);
     }
 }
