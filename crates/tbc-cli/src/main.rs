@@ -21,6 +21,7 @@ use tbc_core::procamp::ProcAmp;
 use tbc_core::sync::ring::RingBuffer;
 use tbc_core::sync::FrameSynchronizer;
 use tbc_core::telemetry::TelemetryCollector;
+use tbc_core::FrameRate;
 use tbc_io::{
     FrameSink, FrameSource, IoError, RawGeometry, RawReader, RawWriter, SequenceSink,
     SequenceSource,
@@ -55,6 +56,11 @@ pub struct Args {
     /// TOML configuration file (CLI flags override it).
     #[arg(long)]
     config: Option<String>,
+    /// Input timestamp mode: nominal (sequence x rate, deterministic)
+    /// or wall-clock (arrival time; for live capture). Sequence input
+    /// always uses nominal.
+    #[arg(long)]
+    stamp: Option<String>,
     /// Stop after emitting this many output frames.
     #[arg(long)]
     max_frames: Option<u64>,
@@ -83,6 +89,46 @@ fn split_sequence(path: &str) -> Option<(String, String)> {
     match path.rfind(['/', '\\']) {
         Some(i) => Some((path[..i].to_string(), path[i + 1..].to_string())),
         None => Some((".".to_string(), path.to_string())),
+    }
+}
+
+/// Synthesizes presentation timestamps for the reader thread
+/// (Issue #20). In `Nominal` mode the stamp depends only on the frame
+/// sequence; in `WallClock` mode it is the elapsed time since the
+/// first frame, so downstream drift estimation sees the source's real
+/// clock. Integer nanoseconds throughout, no float time math.
+struct Stamper {
+    mode: config::StampMode,
+    rate: FrameRate,
+    start: Option<Instant>,
+    sequence: u64,
+}
+
+impl Stamper {
+    fn new(mode: config::StampMode, rate: FrameRate) -> Self {
+        Stamper {
+            mode,
+            rate,
+            start: None,
+            sequence: 0,
+        }
+    }
+
+    /// Stamp the next frame. `now` is the moment its read completed;
+    /// it is ignored in `Nominal` mode.
+    fn stamp(&mut self, now: Instant) -> u64 {
+        let sequence = self.sequence;
+        self.sequence += 1;
+        match self.mode {
+            config::StampMode::Nominal => {
+                ((sequence as u128 * self.rate.den as u128 * 1_000_000_000) / self.rate.num as u128)
+                    as u64
+            }
+            config::StampMode::WallClock => {
+                let start = *self.start.get_or_insert(now);
+                now.saturating_duration_since(start).as_nanos() as u64
+            }
+        }
     }
 }
 
@@ -226,8 +272,21 @@ fn run(cfg: &config::CliConfig) -> i32 {
     let stop_reader = Arc::new(AtomicBool::new(false));
     let reader_error: Arc<Mutex<Option<IoError>>> = Arc::new(Mutex::new(None));
 
-    // Reader thread: stamp each frame with the nominal input timestamp
-    // (raw streams carry none) and push it into the ring.
+    // Wall-clock stamps need arrival times; sequence files have none,
+    // so that combination falls back to nominal with a warning.
+    let stamp_mode = if cfg.stamp == config::StampMode::WallClock
+        && split_sequence(&cfg.input).is_some()
+    {
+        eprintln!(
+            "software-tbc: --stamp wall-clock has no arrival times for sequence input; using nominal"
+        );
+        config::StampMode::Nominal
+    } else {
+        cfg.stamp
+    };
+
+    // Reader thread: stamp each frame (raw streams carry no timestamps
+    // of their own) and push it into the ring.
     let reader_thread = {
         let ring = Arc::clone(&ring);
         let input_done = Arc::clone(&input_done);
@@ -235,6 +294,7 @@ fn run(cfg: &config::CliConfig) -> i32 {
         let reader_error = Arc::clone(&reader_error);
         let rate = core.target_rate;
         std::thread::spawn(move || {
+            let mut stamper = Stamper::new(stamp_mode, rate);
             let mut sequence = 0u64;
             'read: loop {
                 if stop_reader.load(Ordering::Acquire) {
@@ -242,8 +302,7 @@ fn run(cfg: &config::CliConfig) -> i32 {
                 }
                 match source.next_frame() {
                     Ok(Some(mut frame)) => {
-                        frame.pts_ns = ((sequence as u128 * rate.den as u128 * 1_000_000_000)
-                            / rate.num as u128) as u64;
+                        frame.pts_ns = stamper.stamp(Instant::now());
                         frame.sequence = sequence;
                         sequence += 1;
                         loop {
@@ -369,4 +428,53 @@ fn run(cfg: &config::CliConfig) -> i32 {
         return 4;
     }
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn ntsc() -> FrameRate {
+        FrameRate {
+            num: 30_000,
+            den: 1001,
+        }
+    }
+
+    #[test]
+    fn nominal_stamps_follow_the_rate() {
+        let mut stamper = Stamper::new(config::StampMode::Nominal, ntsc());
+        let now = Instant::now();
+        // Sequence -> expected pts_ns at 30000/1001 (integer ns).
+        let expected = [
+            (0u64, 0u64),
+            (1, 33_366_666),
+            (2, 66_733_333),
+            (30, 1_001_000_000),
+        ];
+        for seq in 0..=30u64 {
+            let pts = stamper.stamp(now);
+            if let Some((_, want)) = expected.iter().find(|(s, _)| *s == seq) {
+                assert_eq!(pts, *want, "sequence {seq}");
+            }
+        }
+    }
+
+    #[test]
+    fn wall_clock_stamps_measure_elapsed_time() {
+        let mut stamper = Stamper::new(config::StampMode::WallClock, ntsc());
+        let t0 = Instant::now();
+        // The first frame anchors the clock at zero.
+        assert_eq!(stamper.stamp(t0), 0);
+        // A frame 12.3 ms later stamps at ~12.3 ms (clock granularity
+        // varies by platform, so assert a window, not an exact value).
+        let v = stamper.stamp(t0 + Duration::from_nanos(12_345_678));
+        assert!(
+            (12_000_000..=13_000_000).contains(&v),
+            "wall-clock stamp was {v}"
+        );
+        // An out-of-order instant saturates at zero instead of wrapping.
+        assert_eq!(stamper.stamp(t0), 0);
+    }
 }
